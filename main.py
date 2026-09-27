@@ -80,17 +80,35 @@ PROFILE = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "GoogleAIWind
 
 
 def _exe_dir() -> Path:
-    # Папка запущенного exe (для Nuitka onefile — по argv[0], а не временная распаковка).
+    # 1. Nuitka onefile переменная окружения (точный путь к исходному .exe)
+    nuitka_bin = os.environ.get("NUITKA_ONEFILE_BINARY")
+    if nuitka_bin and os.path.exists(nuitka_bin):
+        try:
+            return Path(os.path.abspath(nuitka_bin)).parent
+        except Exception:
+            pass
+
+    # 2. sys.argv[0]
     try:
         argv0 = sys.argv[0] if sys.argv else ""
-        if argv0 and argv0.lower().endswith(".exe") and os.path.isfile(argv0):
+        if argv0 and os.path.exists(argv0):
             return Path(os.path.abspath(argv0)).parent
     except Exception:
         pass
+
+    # 3. sys.executable
+    try:
+        if sys.executable and os.path.exists(sys.executable):
+            return Path(os.path.abspath(sys.executable)).parent
+    except Exception:
+        pass
+
+    # 4. Папка скрипта / текущая рабочая папка
     try:
         return Path(os.path.dirname(os.path.abspath(__file__)))
     except Exception:
-        return Path.cwd()
+        pass
+    return Path.cwd()
 
 
 def resolve_browser_path() -> str:
@@ -98,12 +116,22 @@ def resolve_browser_path() -> str:
     Поиск браузера: только portable chromium рядом с .exe / скриптом (ТЗ п.8).
     Сторонние браузеры удалены.
     """
-    exe_dir = _exe_dir()
-    candidates = [
-        exe_dir / "chromium" / "chrome.exe",
-        exe_dir / "chromium" / "chromium.exe",
-        exe_dir / "chrome.exe",
-    ]
+    search_dirs = [_exe_dir(), Path.cwd()]
+    try:
+        if sys.argv and sys.argv[0]:
+            search_dirs.append(Path(os.path.abspath(sys.argv[0])).parent)
+    except Exception:
+        pass
+
+    candidates = []
+    for d in search_dirs:
+        candidates.extend([
+            d / "chromium" / "chrome.exe",
+            d / "chromium" / "chromium.exe",
+            d / "chrome.exe",
+            d / "chromium.exe",
+        ])
+
     for c in candidates:
         try:
             if c.is_file():
@@ -226,6 +254,15 @@ if user32:
 
     user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
     user32.GetClientRect.restype = wintypes.BOOL
+
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+    user32.GetWindowRect.restype = wintypes.BOOL
+
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
 
 if kernel32:
     kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
@@ -1186,8 +1223,13 @@ def upload_file_advanced(page: CDP, path: Path, mime: str | None = None) -> bool
         return False
 
 
-def get_child_pids(pid):
-    pids = set()
+def get_child_pids(root_pid):
+    """
+    Возвращает все дочерние PID (рекурсивно по всему дереву процессов).
+    На Windows 11 Chromium запускает несколько уровней дочерних процессов
+    (брокер -> GPU -> utility -> renderer -> UI окно).
+    """
+    pids = {root_pid}
     if not kernel32:
         return pids
 
@@ -1199,15 +1241,27 @@ def get_child_pids(pid):
         pe = PROCESSENTRY32W()
         pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
 
+        tree = {}  # parent_pid -> set of child_pids
         if kernel32.Process32FirstW(snapshot, ctypes.byref(pe)):
             while True:
-                if pe.th32ParentProcessID == pid:
-                    pids.add(pe.th32ProcessID)
+                parent = pe.th32ParentProcessID
+                child = pe.th32ProcessID
+                tree.setdefault(parent, set()).add(child)
 
                 if not kernel32.Process32NextW(snapshot, ctypes.byref(pe)):
                     break
 
         kernel32.CloseHandle(snapshot)
+
+        # Рекурсивный обход в ширину
+        queue = [root_pid]
+        while queue:
+            curr = queue.pop(0)
+            for child in tree.get(curr, []):
+                if child not in pids:
+                    pids.add(child)
+                    queue.append(child)
+
     except Exception:
         pass
 
@@ -1218,26 +1272,48 @@ _enum_callbacks = []
 
 
 def find_chrome_hwnd(pids):
+    """
+    Находит главное окно браузера Chromium.
+    На Windows 11 Chromium создает вспомогательные невидимые/нулевые окна Chrome_WidgetWin_1.
+    Поэтому ищем именно видимое главное окно с наибольшей площадью.
+    """
     if not user32:
         return None
-    result = []
+
+    candidates = []
 
     def callback(hwnd, lparam):
         try:
             pid = wintypes.DWORD()
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
 
-            if pid.value in pids:
-                buf = ctypes.create_unicode_buffer(256)
-                user32.GetClassNameW(hwnd, buf, 256)
-                cls = buf.value
+            buf = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(hwnd, buf, 256)
+            cls = buf.value
 
+            if cls in ("Chrome_WidgetWin_1", "Chrome_WidgetWin_0"):
+                is_our_pid = pid.value in pids if pids else False
+
+                rect = RECT()
+                user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                width = max(0, rect.right - rect.left)
+                height = max(0, rect.bottom - rect.top)
+                area = width * height
+
+                is_visible = bool(user32.IsWindowVisible(hwnd))
+
+                score = 0
+                if is_our_pid:
+                    score += 1000
+                if is_visible:
+                    score += 500
+                if width >= 200 and height >= 200:
+                    score += 300
                 if cls == "Chrome_WidgetWin_1":
-                    result.insert(0, int(hwnd))
-                    return False
+                    score += 100
 
-                if cls == "Chrome_WidgetWin_0":
-                    result.append(int(hwnd))
+                if area > 10000 or (is_our_pid and area > 1000):
+                    candidates.append((score, area, int(hwnd)))
         except Exception:
             pass
 
@@ -1256,7 +1332,12 @@ def find_chrome_hwnd(pids):
         except Exception:
             pass
 
-    return result[0] if result else None
+    if not candidates:
+        return None
+
+    # Сортируем: сначала наибольший score, затем наибольшая площадь
+    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return candidates[0][2]
 
 
 def text_to_pdf_bytes(text: bytes, title: str = "") -> bytes:
