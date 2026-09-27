@@ -824,38 +824,38 @@ JS_DISABLE_DRAG = r"""
 JS_START_RECORDING = r"""
 (() => {
     const findMic = () => {
-        // Точные селекторы кнопки микрофона
+        // 1. Поиск по специфичным атрибутам и классам кнопки микрофона
         const selectors = [
-            'button[aria-label="Микрофон"]',
-            'button.vpw7Fc',
+            'button[data-xid="input-plate-voice-button"]',
             'button[data-xid="h4gG8"]',
             'button.uMMzHc.vpw7Fc',
-            'button[data-xid="input-plate-voice-button"]',
+            'button.vpw7Fc',
+            'button[aria-label="Микрофон"]',
+            'button[aria-label="Использовать микрофон"]',
             'button[aria-label*="икрофон" i]',
-            'button[aria-label*="олос" i]',
             'button[aria-label*="дикт" i]',
-            'button[aria-label*="icrophone" i]',
-            'button[aria-label*="oice" i]:not([aria-label*="send" i]):not([aria-label*="тправ" i])',
-            'div[role="button"][aria-label*="икрофон" i]',
-            'div[role="button"][aria-label*="icrophone" i]'
+            'button[aria-label*="Microphone" i]',
+            'button[aria-label*="voice" i]:not([aria-label*="send" i]):not([aria-label*="тправ" i])',
+            'div[role="button"][aria-label*="икрофон" i]'
         ];
         for (const sel of selectors) {
             const el = document.querySelector(sel);
-            if (el) return el;
+            if (el && el.offsetParent !== null) return el;
         }
 
-        // Поиск по SVG / иконкам микрофона
-        const icons = Array.from(document.querySelectorAll('mat-icon, svg, i'));
-        for (const ic of icons) {
-            const name = (ic.getAttribute('data-mat-icon-name') || ic.getAttribute('data-icon') || ic.className || '').toLowerCase();
-            if (name.includes('mic') || name.includes('voice')) {
-                const p = ic.closest('button, div[role="button"]');
-                if (p && !(p.getAttribute('data-xid') || '').includes('send')) return p;
+        // 2. Поиск внутри контейнера ввода (input plate / footer / bottom form)
+        const inputArea = document.querySelector('.esoFne, .Txyg0d, footer, [role="region"], form') || document.body;
+        const buttons = Array.from(inputArea.querySelectorAll('button, div[role="button"]'));
+        for (const btn of buttons) {
+            const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+            const xid = (btn.getAttribute('data-xid') || '').toLowerCase();
+            if ((label.includes('микрофон') || label.includes('mic') || xid.includes('voice')) && !xid.includes('send')) {
+                return btn;
             }
         }
 
-        // Поиск по SVG path
-        const paths = Array.from(document.querySelectorAll('svg path'));
+        // 3. Поиск по SVG path иконки микрофона
+        const paths = Array.from(inputArea.querySelectorAll('svg path'));
         for (const p of paths) {
             const d = p.getAttribute('d') || '';
             if (d.includes('M480-400') || d.includes('M12 14c1.66') || d.includes('M12 2a3 3 0')) {
@@ -916,6 +916,7 @@ JS_CHECK_RECORDING = r"""
 JS_STOP_AND_SEND = r"""
 (() => {
     const findSend = () => {
+        // 1. Поиск точной кнопки отправки голосового ввода
         const selectors = [
             'button[data-xid="input-plate-voice-send-button"]',
             'button.wdK4Nc',
@@ -933,59 +934,73 @@ JS_STOP_AND_SEND = r"""
             if (el) return el;
         }
 
-        const icons = Array.from(document.querySelectorAll('mat-icon, svg, i'));
-        for (const ic of icons) {
-            const name = (ic.getAttribute('data-mat-icon-name') || ic.getAttribute('data-icon') || ic.className || '').toLowerCase();
-            if (name.includes('send') || name.includes('submit')) {
-                const p = ic.closest('button, div[role="button"]');
-                if (p) return p;
+        // 2. Поиск по иконке отправки в области ввода
+        const inputArea = document.querySelector('.esoFne, .Txyg0d, footer, form') || document.body;
+        const buttons = Array.from(inputArea.querySelectorAll('button, div[role="button"]'));
+        for (const btn of buttons) {
+            const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+            const xid = (btn.getAttribute('data-xid') || '').toLowerCase();
+            if (label.includes('отправ') || label.includes('send') || xid.includes('send')) {
+                return btn;
             }
         }
         return null;
     };
 
-    const el = findSend();
-    if (!el) {
-        // Fallback: Enter в поле ввода
-        const inputEl = document.querySelector('textarea, div[contenteditable="true"], div[role="textbox"]');
-        if (inputEl) {
-            try { inputEl.focus(); } catch(e) {}
-            const opts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
-            inputEl.dispatchEvent(new KeyboardEvent('keydown', opts));
-            inputEl.dispatchEvent(new KeyboardEvent('keypress', opts));
-            inputEl.dispatchEvent(new KeyboardEvent('keyup', opts));
-            return { ok: true, fallback: 'enter' };
-        }
-        return { ok: false, reason: 'not_found' };
-    }
+    const triggerClick = (el) => {
+        if (!el) return null;
+        try { el.disabled = false; } catch(e) {}
+        try { el.removeAttribute('disabled'); } catch(e) {}
+        try { el.setAttribute('aria-disabled', 'false'); } catch(e) {}
+        try { el.focus(); } catch(e) {}
 
-    try { el.disabled = false; } catch(e) {}
-    try { el.removeAttribute('disabled'); } catch(e) {}
-    try { el.setAttribute('aria-disabled', 'false'); } catch(e) {}
-    try { el.focus(); } catch(e) {}
+        const rect = el.getBoundingClientRect();
+        const x = rect.left + rect.width / 2;
+        const y = rect.top + rect.height / 2;
 
-    const rect = el.getBoundingClientRect();
-    const x = rect.left + rect.width / 2;
-    const y = rect.top + rect.height / 2;
+        const evOpts = {
+            bubbles: true,
+            cancelable: true,
+            view: window,
+            clientX: x,
+            clientY: y,
+            button: 0,
+            buttons: 1
+        };
 
-    const evOpts = {
-        bubbles: true,
-        cancelable: true,
-        view: window,
-        clientX: x,
-        clientY: y,
-        button: 0,
-        buttons: 1
+        try { el.dispatchEvent(new PointerEvent('pointerdown', { ...evOpts, pointerId: 1, pointerType: 'mouse', isPrimary: true, pressure: 0.5 })); } catch(e) {}
+        try { el.dispatchEvent(new MouseEvent('mousedown', evOpts)); } catch(e) {}
+        try { el.dispatchEvent(new PointerEvent('pointerup', { ...evOpts, pointerId: 1, pointerType: 'mouse', isPrimary: true, buttons: 0, pressure: 0 })); } catch(e) {}
+        try { el.dispatchEvent(new MouseEvent('mouseup', { ...evOpts, buttons: 0 })); } catch(e) {}
+        try { el.dispatchEvent(new MouseEvent('click', { ...evOpts, buttons: 0 })); } catch(e) {}
+        try { el.click(); } catch(e) {}
+
+        return { ok: true, x: x, y: y };
     };
 
-    try { el.dispatchEvent(new PointerEvent('pointerdown', { ...evOpts, pointerId: 1, pointerType: 'mouse', isPrimary: true, pressure: 0.5 })); } catch(e) {}
-    try { el.dispatchEvent(new MouseEvent('mousedown', evOpts)); } catch(e) {}
-    try { el.dispatchEvent(new PointerEvent('pointerup', { ...evOpts, pointerId: 1, pointerType: 'mouse', isPrimary: true, buttons: 0, pressure: 0 })); } catch(e) {}
-    try { el.dispatchEvent(new MouseEvent('mouseup', { ...evOpts, buttons: 0 })); } catch(e) {}
-    try { el.dispatchEvent(new MouseEvent('click', { ...evOpts, buttons: 0 })); } catch(e) {}
-    try { el.click(); } catch(e) {}
+    const el = findSend();
+    if (el) {
+        return triggerClick(el);
+    }
 
-    return { ok: true, x: x, y: y };
+    // Fallback: клик по контейнеру остановки или Enter в текстовом поле
+    const waveEl = document.querySelector('.tFTltc, .pRjbAe, .S34Aff');
+    if (waveEl) {
+        triggerClick(waveEl);
+    }
+
+    const inputEl = document.querySelector('textarea, div[contenteditable="true"], div[role="textbox"]');
+    if (inputEl) {
+        try { inputEl.hidden = false; } catch(e) {}
+        try { inputEl.focus(); } catch(e) {}
+        const opts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
+        inputEl.dispatchEvent(new KeyboardEvent('keydown', opts));
+        inputEl.dispatchEvent(new KeyboardEvent('keypress', opts));
+        inputEl.dispatchEvent(new KeyboardEvent('keyup', opts));
+        return { ok: true, fallback: 'enter' };
+    }
+
+    return { ok: false, reason: 'not_found' };
 })()
 """
 
@@ -1673,16 +1688,14 @@ class LoginWindow(QDialog):
 
         self.login_btn = QPushButton("Войти")
         self.login_btn.setObjectName("Primary")
-        self.login_btn.setDefault(True)
-        self.login_btn.setAutoDefault(True)
+        self.login_btn.setDefault(False)
+        self.login_btn.setAutoDefault(False)
         self.login_btn.clicked.connect(self._do_login)
         btn_layout.addWidget(self.login_btn)
 
         layout.addLayout(btn_layout)
 
-        self.pass_input.returnPressed.connect(self._do_login)
-        self.login_input.returnPressed.connect(self._do_login)
-
+        self._is_logging_in = False
         self._worker = None
         self._hwid_worker = None
         self._auth_data = {}
@@ -1699,6 +1712,11 @@ class LoginWindow(QDialog):
         super().keyPressEvent(event)
 
     def _do_login(self):
+        if self._is_logging_in:
+            return
+        if self._worker and self._worker.isRunning():
+            return
+
         login = self.login_input.text().strip()
         password = self.pass_input.text().strip()
 
@@ -1706,7 +1724,9 @@ class LoginWindow(QDialog):
             self.error_label.setText("Введите логин и пароль")
             return
 
+        self._is_logging_in = True
         self.login_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(False)
         self.error_label.setText("Подключение…")
 
         self._worker = AuthWorker(login, password, self.remember_cb.isChecked())
@@ -1714,8 +1734,10 @@ class LoginWindow(QDialog):
         self._worker.start()
 
     def _on_auth(self, ok, err, data):
-        self.login_btn.setEnabled(True)
         if not ok:
+            self._is_logging_in = False
+            self.login_btn.setEnabled(True)
+            self.cancel_btn.setEnabled(True)
             self.error_label.setText(err)
             return
 
@@ -1724,6 +1746,9 @@ class LoginWindow(QDialog):
         user = data.get("user", {})
 
         if not token:
+            self._is_logging_in = False
+            self.login_btn.setEnabled(True)
+            self.cancel_btn.setEnabled(True)
             self.error_label.setText("Ошибка: сервер не вернул токен")
             return
 
@@ -1765,14 +1790,19 @@ class LoginWindow(QDialog):
             self._hwid_worker.done.connect(lambda ok2, err2: self._on_hwid(ok2, err2, cfg, user))
             self._hwid_worker.start()
         else:
+            self._is_logging_in = False
             self.login_success.emit(cfg, token, user)
             self.accept()
 
     def _on_hwid(self, ok, err, cfg, user):
         if not ok:
+            self._is_logging_in = False
+            self.login_btn.setEnabled(True)
+            self.cancel_btn.setEnabled(True)
             self.error_label.setText(f"HWID: {err}")
             return
 
+        self._is_logging_in = False
         self.login_success.emit(cfg, cfg.get("token", ""), user)
         self.accept()
 
@@ -3009,46 +3039,26 @@ class MainWindow(QMainWindow):
 
         now = time.monotonic()
         # Защита от дребезга и удержания клавиши (одиночное нажатие)
-        if self._mic_busy or (now - self._mic_last_ts) < 0.45:
+        if self._mic_busy or (now - self._mic_last_ts) < 0.35:
             return
 
         self._mic_last_ts = now
         self._mic_busy = True
 
+        # Снимаем блокировку СТРОГО в главном потоке Qt
+        QTimer.singleShot(350, lambda: setattr(self, "_mic_busy", False))
+
         if not self.mic_active:
             # ─────────────────────────────────────────────────────────────
-            # 1-е нажатие: старт записи речи + опрос подтверждения
+            # 1-е нажатие: старт записи речи (п.1 ТЗ)
             # ─────────────────────────────────────────────────────────────
+            self.mic_active = True
+            self.chip_mic.set_active(True)
+            self._set_status("Запись голоса… (повтор: отправить)", THEME["ok"])
+
             def on_mic_eval(val):
                 if isinstance(val, dict) and "x" in val and "y" in val:
                     self._cdp_click_coords(val["x"], val["y"])
-
-                self._check_mic_start_attempts = 0
-
-                def verify_loop():
-                    if not self.worker or not getattr(self.worker, "page", None):
-                        self._mic_busy = False
-                        return
-
-                    self._check_mic_start_attempts += 1
-                    is_rec = False
-                    try:
-                        res = self.worker.page.eval(JS_CHECK_RECORDING, timeout=1)
-                        val_rec = res.get("value") if isinstance(res, dict) else res
-                        is_rec = bool(val_rec.get("recording")) if isinstance(val_rec, dict) else False
-                    except Exception:
-                        is_rec = False
-
-                    if is_rec or self._check_mic_start_attempts >= 15:
-                        self.mic_active = True
-                        self.chip_mic.set_active(True)
-                        self._set_status("Запись голоса… (повтор: отправить)", THEME["ok"])
-                        # Снимаем блокировку, чтобы пользователь мог нажать повторно для отправки
-                        QTimer.singleShot(350, lambda: setattr(self, "_mic_busy", False))
-                    else:
-                        QTimer.singleShot(80, verify_loop)
-
-                QTimer.singleShot(60, verify_loop)
 
             self._page_eval_async(JS_START_RECORDING, timeout=3, callback=on_mic_eval)
         else:
@@ -3062,10 +3072,9 @@ class MainWindow(QMainWindow):
             def on_send_eval(val):
                 if isinstance(val, dict) and "x" in val and "y" in val:
                     self._cdp_click_coords(val["x"], val["y"])
-                QTimer.singleShot(500, lambda: setattr(self, "_mic_busy", False))
-                QTimer.singleShot(2500, lambda: self._set_status("Готов к работе", THEME["ok"]))
 
             self._page_eval_async(JS_STOP_AND_SEND, timeout=3, callback=on_send_eval)
+            QTimer.singleShot(2500, lambda: self._set_status("Готов к работе", THEME["ok"]))
 
     def _open_template(self):
         overlay_was_visible = self.overlay.isVisible()
