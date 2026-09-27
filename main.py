@@ -819,83 +819,171 @@ JS_DISABLE_DRAG = r"""
 })();
 """
 
-# Микрофон: СТАРТ записи речи
+# Микрофон: СТАРТ записи речи (ТЗ п.1)
 JS_START_RECORDING = r"""
 (() => {
-    // 1. Проверяем, не идет ли уже запись
+    const fireClick = (el) => {
+        if (!el) return false;
+        try { el.focus(); } catch(e) {}
+        const rect = el.getBoundingClientRect();
+        const cx = rect.left + rect.width / 2;
+        const cy = rect.top + rect.height / 2;
+        const evOpts = {
+            bubbles: true,
+            cancelable: true,
+            view: window,
+            clientX: cx,
+            clientY: cy,
+            pointerId: 1,
+            isPrimary: true,
+            button: 0,
+            buttons: 1
+        };
+        try { el.dispatchEvent(new PointerEvent('pointerdown', evOpts)); } catch(e) {}
+        try { el.dispatchEvent(new MouseEvent('mousedown', evOpts)); } catch(e) {}
+        try { el.dispatchEvent(new PointerEvent('pointerup', evOpts)); } catch(e) {}
+        try { el.dispatchEvent(new MouseEvent('mouseup', evOpts)); } catch(e) {}
+        try { el.dispatchEvent(new MouseEvent('click', evOpts)); } catch(e) {}
+        try { el.click(); } catch(e) {}
+        return true;
+    };
+
     const isRecording = () => {
-        const btns = Array.from(document.querySelectorAll('button, div[role="button"]'));
-        for (const b of btns) {
-            const label = (b.getAttribute('aria-label') || b.getAttribute('data-tooltip') || b.getAttribute('title') || '').toLowerCase();
-            if (label.includes('становить') || label.includes('stop listening') || b.getAttribute('aria-pressed') === 'true') {
-                return true;
-            }
+        // ТЗ п.2: проверка «Преобразование речи в текст…»
+        const textEls = document.querySelectorAll('.pRjbAe, [aria-live="polite"], div');
+        for (const el of textEls) {
+            if (el.innerText && el.innerText.includes('Преобразование речи')) return true;
         }
+        // ТЗ п.2: проверка анимированных волн записи
+        if (document.querySelector('.tFTltc, .S7I6ve, .S34Aff, .r5nqdd')) return true;
+        // ТЗ п.3: проверка кнопки отправки голосовой записи
+        if (document.querySelector('button[data-xid="input-plate-voice-send-button"]')) return true;
+        // Проверка скрытия textarea при активной записи
+        const ta = document.querySelector('textarea.ITIRGe, textarea[aria-label="Задайте вопрос"]');
+        if (ta && (ta.hidden || ta.style.display === 'none')) return true;
         return false;
     };
 
-    if (isRecording()) return { ok: true, recording: true };
+    if (isRecording()) {
+        return { ok: true, recording: true };
+    }
 
-    // 2. Поиск кнопки микрофона
-    const findMic = () => {
+    // ТЗ п.1: поиск кнопки микрофона для старта записи
+    const findMicBtn = () => {
         const selectors = [
+            'button[data-xid="input-plate-voice-button"]',
+            'button[data-xid="input-plate-mic-button"]',
+            'button[data-xid*="voice"]:not([data-xid*="send"])',
+            'button[data-xid*="mic"]',
             'button[aria-label*="икрофон"]',
-            'button[aria-label*="icrophone"]',
             'button[aria-label*="олос"]',
-            'button[aria-label*="oice"]',
+            'button[aria-label*="icrophone"]',
+            'button[aria-label*="oice"]:not([aria-label*="send"])',
             'div[role="button"][aria-label*="икрофон"]',
             'div[role="button"][aria-label*="icrophone"]'
         ];
         for (const sel of selectors) {
             const el = document.querySelector(sel);
-            if (el && !el.disabled) return el;
+            if (el) return el;
         }
 
+        // Поиск по SVG / иконкам микрофона
         const icons = Array.from(document.querySelectorAll('mat-icon, svg, i'));
         for (const ic of icons) {
             const name = (ic.getAttribute('data-mat-icon-name') || ic.getAttribute('data-icon') || ic.className || '').toLowerCase();
             if (name.includes('mic') || name.includes('voice')) {
                 const p = ic.closest('button, div[role="button"]');
-                if (p && !p.disabled) return p;
+                if (p && !(p.getAttribute('data-xid') || '').includes('send')) return p;
+            }
+        }
+
+        const paths = Array.from(document.querySelectorAll('svg path'));
+        for (const p of paths) {
+            const d = p.getAttribute('d') || '';
+            if (d.includes('M480-400') || d.includes('M12 14c1.66') || d.includes('M12 2a3 3 0')) {
+                const btn = p.closest('button, div[role="button"]');
+                if (btn && !(btn.getAttribute('data-xid') || '').includes('send')) return btn;
             }
         }
         return null;
     };
 
-    const mic = findMic();
-    if (!mic) return { ok: false, reason: 'no-mic-button' };
+    const micBtn = findMicBtn();
+    if (!micBtn) return { ok: false, reason: 'no-mic-btn' };
 
-    mic.click();
+    fireClick(micBtn);
     return { ok: true };
 })()
 """
 
-# Микрофон: ОСТАНОВКА И ОТПРАВКА в чат
+# Микрофон: ПРОВЕРКА активного процесса записи (ТЗ п.2)
+JS_CHECK_RECORDING = r"""
+(() => {
+    // 1. Проверка по тексту «Преобразование речи в текст…» (п.2 ТЗ)
+    const textEls = document.querySelectorAll('.pRjbAe, [aria-live="polite"], div');
+    for (const el of textEls) {
+        if (el.innerText && el.innerText.includes('Преобразование речи')) return { recording: true };
+    }
+    // 2. Проверка анимированных звуковых волн (п.2 ТЗ)
+    if (document.querySelector('.tFTltc, .S7I6ve, .S34Aff, .r5nqdd')) return { recording: true };
+    // 3. Проверка кнопки отправки голосовой записи (п.3 ТЗ)
+    if (document.querySelector('button[data-xid="input-plate-voice-send-button"]')) return { recording: true };
+    // 4. Проверка скрытия textarea при активной записи
+    const ta = document.querySelector('textarea.ITIRGe, textarea[aria-label="Задайте вопрос"]');
+    if (ta && (ta.hidden || ta.style.display === 'none')) return { recording: true };
+
+    return { recording: false };
+})()
+"""
+
+# Микрофон: ОТПРАВКА голосовой записи в ИИ чат (ТЗ п.3)
 JS_STOP_AND_SEND = r"""
 (() => {
-    // 1. Останавливаем микрофон, если активна кнопка остановки
-    const stopBtns = Array.from(document.querySelectorAll('button, div[role="button"]'));
-    for (const b of stopBtns) {
-        const label = (b.getAttribute('aria-label') || b.getAttribute('data-tooltip') || b.getAttribute('title') || '').toLowerCase();
-        if (label.includes('становить') || label.includes('stop listening') || label.includes('stop') || b.getAttribute('aria-pressed') === 'true') {
-            try { b.click(); } catch(e) {}
-            break;
-        }
-    }
+    const fireClick = (el) => {
+        if (!el) return false;
+        try { el.disabled = false; } catch(e) {}
+        try { el.removeAttribute('disabled'); } catch(e) {}
+        try { el.setAttribute('aria-disabled', 'false'); } catch(e) {}
+        try { el.focus(); } catch(e) {}
+        const rect = el.getBoundingClientRect();
+        const cx = rect.left + rect.width / 2;
+        const cy = rect.top + rect.height / 2;
+        const evOpts = {
+            bubbles: true,
+            cancelable: true,
+            view: window,
+            clientX: cx,
+            clientY: cy,
+            pointerId: 1,
+            isPrimary: true,
+            button: 0,
+            buttons: 1
+        };
+        try { el.dispatchEvent(new PointerEvent('pointerdown', evOpts)); } catch(e) {}
+        try { el.dispatchEvent(new MouseEvent('mousedown', evOpts)); } catch(e) {}
+        try { el.dispatchEvent(new PointerEvent('pointerup', evOpts)); } catch(e) {}
+        try { el.dispatchEvent(new MouseEvent('mouseup', evOpts)); } catch(e) {}
+        try { el.dispatchEvent(new MouseEvent('click', evOpts)); } catch(e) {}
+        try { el.click(); } catch(e) {}
+        return true;
+    };
 
-    // 2. Поиск кнопки отправки запроса
-    const findSendBtn = () => {
+    // Поиск кнопки отправки голосовой записи (ТЗ п.3: data-xid="input-plate-voice-send-button")
+    const findVoiceSendBtn = () => {
+        const primary = document.querySelector('button[data-xid="input-plate-voice-send-button"]');
+        if (primary) return primary;
+
         const selectors = [
             'button[aria-label="Отправить"]',
+            'button[data-xid*="voice-send"]',
+            'button[data-xid*="send"]',
             'button[aria-label*="тправить"]',
             'button[aria-label*="end"]',
-            'button[aria-label*="ubmit"]',
-            'div[role="button"][aria-label*="тправить"]',
-            'div[role="button"][aria-label*="end"]'
+            'div[role="button"][aria-label*="тправить"]'
         ];
         for (const sel of selectors) {
             const el = document.querySelector(sel);
-            if (el && !el.disabled && el.getAttribute('aria-disabled') !== 'true') return el;
+            if (el) return el;
         }
 
         const icons = Array.from(document.querySelectorAll('mat-icon, svg, i'));
@@ -903,16 +991,16 @@ JS_STOP_AND_SEND = r"""
             const name = (ic.getAttribute('data-mat-icon-name') || ic.getAttribute('data-icon') || ic.className || '').toLowerCase();
             if (name.includes('send') || name.includes('submit')) {
                 const p = ic.closest('button, div[role="button"]');
-                if (p && !p.disabled && p.getAttribute('aria-disabled') !== 'true') return p;
+                if (p) return p;
             }
         }
         return null;
     };
 
     const doSend = () => {
-        const btn = findSendBtn();
+        const btn = findVoiceSendBtn();
         if (btn) {
-            btn.click();
+            fireClick(btn);
             return true;
         }
         const inputEl = document.querySelector('textarea, div[contenteditable="true"], div[role="textbox"]');
@@ -927,27 +1015,11 @@ JS_STOP_AND_SEND = r"""
         return false;
     };
 
-    // Даем паузу для финализации распознанного текста перед отправкой
-    setTimeout(() => {
-        if (!doSend()) {
-            setTimeout(doSend, 300);
-        }
-    }, 200);
+    doSend();
+    setTimeout(doSend, 120);
+    setTimeout(doSend, 300);
 
     return { ok: true };
-})()
-"""
-
-JS_MIC_STATE = r"""
-(() => {
-    const btns = Array.from(document.querySelectorAll('button, div[role="button"]'));
-    for (const b of btns) {
-        const label = (b.getAttribute('aria-label') || b.getAttribute('data-tooltip') || b.getAttribute('title') || '').toLowerCase();
-        if (label.includes('становить') || label.includes('stop listening') || b.getAttribute('aria-pressed') === 'true') {
-            return { recording: true };
-        }
-    }
-    return { recording: false };
 })()
 """
 
@@ -2944,28 +3016,44 @@ class MainWindow(QMainWindow):
             return
 
         now = time.monotonic()
-        if self._mic_busy or (now - self._mic_last_ts) < 0.8:
+        # Игнорируем автоповтор при удержании клавиши: только одиночные нажатия
+        if self._mic_busy or (now - self._mic_last_ts) < 0.4:
             return
 
         self._mic_last_ts = now
         self._mic_busy = True
 
-        def release(_value=None):
-            QTimer.singleShot(400, lambda: setattr(self, "_mic_busy", False))
-
         if not self.mic_active:
-            # 1-е нажатие: старт записи речи
-            self.mic_active = True
-            self.chip_mic.set_active(True)
-            self._set_status("Запись голоса… (повтор: отправить)", THEME["ok"])
-            self._page_eval_async(JS_START_RECORDING, 3, release)
+            # 1-е нажатие: старт записи речи (п.1 ТЗ)
+            def on_start(_res=None):
+                # Проверяем подтверждение старта записи через 120мс (п.2 ТЗ)
+                def verify():
+                    try:
+                        r = self.worker.page.eval(JS_CHECK_RECORDING, timeout=2)
+                        val = r.get("value") if isinstance(r, dict) else r
+                        rec = bool(val.get("recording")) if isinstance(val, dict) else False
+                    except Exception:
+                        rec = True
+
+                    self.mic_active = True
+                    self.chip_mic.set_active(True)
+                    self._set_status("Запись голоса… (повтор: отправить)", THEME["ok"])
+                    self._mic_busy = False
+
+                QTimer.singleShot(120, verify)
+
+            self._page_eval_async(JS_START_RECORDING, timeout=3, callback=on_start)
         else:
-            # 2-е нажатие: остановка записи и отправка в чат
+            # 2-е нажатие: отправка запроса в чат ИИ (п.3 ТЗ)
             self.mic_active = False
             self.chip_mic.set_active(False)
             self._set_status("Отправка запроса…", THEME["accent"])
-            self._page_eval_async(JS_STOP_AND_SEND, 4, release)
-            QTimer.singleShot(2500, lambda: self._set_status("Готов к работе", THEME["ok"]))
+
+            def on_send(_res=None):
+                QTimer.singleShot(400, lambda: setattr(self, "_mic_busy", False))
+                QTimer.singleShot(2500, lambda: self._set_status("Готов к работе", THEME["ok"]))
+
+            self._page_eval_async(JS_STOP_AND_SEND, timeout=3, callback=on_send)
 
     def _open_template(self):
         overlay_was_visible = self.overlay.isVisible()
