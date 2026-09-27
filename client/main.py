@@ -1666,11 +1666,15 @@ class LoginWindow(QDialog):
 
         self.cancel_btn = QPushButton("Отмена")
         self.cancel_btn.setObjectName("Ghost")
+        self.cancel_btn.setDefault(False)
+        self.cancel_btn.setAutoDefault(False)
         self.cancel_btn.clicked.connect(self.reject)
         btn_layout.addWidget(self.cancel_btn)
 
         self.login_btn = QPushButton("Войти")
         self.login_btn.setObjectName("Primary")
+        self.login_btn.setDefault(True)
+        self.login_btn.setAutoDefault(True)
         self.login_btn.clicked.connect(self._do_login)
         btn_layout.addWidget(self.login_btn)
 
@@ -1682,6 +1686,17 @@ class LoginWindow(QDialog):
         self._worker = None
         self._hwid_worker = None
         self._auth_data = {}
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._do_login()
+            event.accept()
+            return
+        elif event.key() == Qt.Key.Key_Escape:
+            self.reject()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _do_login(self):
         login = self.login_input.text().strip()
@@ -2993,29 +3008,53 @@ class MainWindow(QMainWindow):
             return
 
         now = time.monotonic()
-        # Игнорируем автоповтор при удержании клавиши: только одиночные нажатия с интервалом от 0.6с
-        if self._mic_busy or (now - self._mic_last_ts) < 0.6:
+        # Защита от дребезга и удержания клавиши (одиночное нажатие)
+        if self._mic_busy or (now - self._mic_last_ts) < 0.45:
             return
 
         self._mic_last_ts = now
         self._mic_busy = True
 
-        # Снимаем блокировку через 600мс
-        QTimer.singleShot(600, lambda: setattr(self, "_mic_busy", False))
-
         if not self.mic_active:
-            # 1-е нажатие: старт записи речи (п.1 ТЗ)
-            self.mic_active = True
-            self.chip_mic.set_active(True)
-            self._set_status("Запись голоса… (повтор: отправить)", THEME["ok"])
-
+            # ─────────────────────────────────────────────────────────────
+            # 1-е нажатие: старт записи речи + опрос подтверждения
+            # ─────────────────────────────────────────────────────────────
             def on_mic_eval(val):
                 if isinstance(val, dict) and "x" in val and "y" in val:
                     self._cdp_click_coords(val["x"], val["y"])
 
+                self._check_mic_start_attempts = 0
+
+                def verify_loop():
+                    if not self.worker or not getattr(self.worker, "page", None):
+                        self._mic_busy = False
+                        return
+
+                    self._check_mic_start_attempts += 1
+                    is_rec = False
+                    try:
+                        res = self.worker.page.eval(JS_CHECK_RECORDING, timeout=1)
+                        val_rec = res.get("value") if isinstance(res, dict) else res
+                        is_rec = bool(val_rec.get("recording")) if isinstance(val_rec, dict) else False
+                    except Exception:
+                        is_rec = False
+
+                    if is_rec or self._check_mic_start_attempts >= 15:
+                        self.mic_active = True
+                        self.chip_mic.set_active(True)
+                        self._set_status("Запись голоса… (повтор: отправить)", THEME["ok"])
+                        # Снимаем блокировку, чтобы пользователь мог нажать повторно для отправки
+                        QTimer.singleShot(350, lambda: setattr(self, "_mic_busy", False))
+                    else:
+                        QTimer.singleShot(80, verify_loop)
+
+                QTimer.singleShot(60, verify_loop)
+
             self._page_eval_async(JS_START_RECORDING, timeout=3, callback=on_mic_eval)
         else:
+            # ─────────────────────────────────────────────────────────────
             # 2-е нажатие: отправка запроса в чат ИИ (п.3 ТЗ)
+            # ─────────────────────────────────────────────────────────────
             self.mic_active = False
             self.chip_mic.set_active(False)
             self._set_status("Отправка запроса…", THEME["accent"])
@@ -3023,6 +3062,7 @@ class MainWindow(QMainWindow):
             def on_send_eval(val):
                 if isinstance(val, dict) and "x" in val and "y" in val:
                     self._cdp_click_coords(val["x"], val["y"])
+                QTimer.singleShot(500, lambda: setattr(self, "_mic_busy", False))
                 QTimer.singleShot(2500, lambda: self._set_status("Готов к работе", THEME["ok"]))
 
             self._page_eval_async(JS_STOP_AND_SEND, timeout=3, callback=on_send_eval)
