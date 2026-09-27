@@ -1,0 +1,24 @@
+python -m nuitka --onefile --windows-console-mode=disable --enable-plugin=pyqt6 --include-package=requests --include-package=websocket --include-package=cryptography --include-package=fpdf --include-data-file=data/DejaVuSans.ttf=data/DejaVuSans.ttf --lto=yes --assume-yes-for-downloads --output-dir=build --output-filename=Legalyze.exe main.py
+
+REM ============================================================================
+REM Legalyze — сборка ОДНОГО .exe файла (Nuitka onefile). Запуск из папки client
+REM на Windows, где лежит main.py. Результат: build\Legalyze.exe (один файл).
+REM ============================================================================
+REM Перед сборкой один раз:
+REM   pip install --upgrade pip
+REM   pip install nuitka pyqt6 requests websocket-client cryptography fpdf2
+REM (папка data\DejaVuSans.ttf должна лежать рядом с main.py)
+REM
+REM Что означают ключи:
+REM   --onefile                  — упаковать всё в ОДИН .exe (было --standalone: папка)
+REM   --windows-console-mode=disable — без чёрного консольного окна
+REM   --enable-plugin=pyqt6      — поддержка интерфейса PyQt6
+REM   --include-package=...      — втянуть сети/шифрование/PDF (legacy-фолбэк)
+REM   --include-data-file=...    — встроить шрифт для PDF
+REM   --lto=yes                  — оптимизация (можно убрать для ускорения сборки)
+REM   --assume-yes-for-downloads — Nuitka сама докачает компилятор при нужде
+REM   --output-filename=Legalyze.exe — имя итогового файла
+REM
+REM Необязательно: своя иконка (если рядом есть icon.ico), добавить в команду:
+REM   --windows-icon-from-ico=icon.ico
+REM Необязательно: ускорить сборку (убрать --lto=yes).
