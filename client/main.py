@@ -2387,37 +2387,45 @@ class ChromeWorker(QThread):
     def run(self):
         try:
             self.proc, port = launch_chrome()
-            self.browser, self.page = attach_chrome(port)
+            if not self.proc:
+                self.failed.emit()
+                return
 
-            grant_mic_permission(self.browser, self.page)
-            install_purge(self.page)
-
-            # Ожидаем завершения загрузки базовой страницы
-            for _ in range(150):
-                try:
-                    ready = self.page.eval("document.readyState", timeout=5).get("value")
-                    url = self.page.eval("location.href", timeout=5).get("value", "")
-                    if ready in ("interactive", "complete") and url and url != "about:blank":
-                        break
-                except Exception:
-                    pass
-                time.sleep(0.1)
-
-            grant_mic_permission(self.browser, self.page)
+            pids = {self.proc.pid}
+            pids.update(get_child_pids(self.proc.pid))
 
             hwnd = None
-            for _ in range(200):
-                pids = {self.proc.pid}
+            for _ in range(80):
                 pids.update(get_child_pids(self.proc.pid))
                 hwnd = find_chrome_hwnd(pids)
                 if hwnd:
                     break
-                time.sleep(0.1)
+                time.sleep(0.05)
 
             if hwnd:
                 self.hwnd_ready.emit(int(hwnd))
-            else:
-                self.failed.emit()
+
+            # Подключаем CDP параллельно в фоне
+            try:
+                self.browser, self.page = attach_chrome(port)
+                grant_mic_permission(self.browser, self.page)
+                install_purge(self.page)
+            except Exception:
+                pass
+
+            # Если HWND не был захвачен в первые секунды, повторяем поиск
+            if not hwnd:
+                for _ in range(150):
+                    pids.update(get_child_pids(self.proc.pid))
+                    hwnd = find_chrome_hwnd(pids)
+                    if hwnd:
+                        break
+                    time.sleep(0.1)
+
+                if hwnd:
+                    self.hwnd_ready.emit(int(hwnd))
+                else:
+                    self.failed.emit()
 
         except Exception:
             self.failed.emit()
@@ -2688,6 +2696,7 @@ class MainWindow(QMainWindow):
 
         self.browser_placeholder = QWidget(self.central_widget)
         self.browser_placeholder.setGeometry(0, 0, W, H)
+        self.browser_placeholder.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
         self.browser_placeholder.setStyleSheet(f"background: {THEME['bg']};")
         self.browser_cover = QWidget(self.browser_placeholder)
         self.browser_cover.setGeometry(0, 0, W, H)
@@ -2704,9 +2713,8 @@ class MainWindow(QMainWindow):
         self._refresh_balance()
         self._sync_template_from_server()
 
-        self.init_timer = QTimer(self)
-        self.init_timer.timeout.connect(self._start_chrome)
-        self.init_timer.setSingleShot(True)
+        # Запускаем Chromium немедленно, не блокируя GUI
+        QTimer.singleShot(10, self._start_chrome)
 
         self._last_decremented_response_state = 0
 
@@ -2865,6 +2873,7 @@ class MainWindow(QMainWindow):
         self._update_prompt_label()
 
         for w in (self.overlay_top, self.overlay_left, self.overlay_right, self.overlay_bottom):
+            w.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
             w.raise_()
 
     def _update_query_label(self):
@@ -2976,6 +2985,21 @@ class MainWindow(QMainWindow):
                 p_height,
                 SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW,
             )
+
+            for w in (self.overlay_top, self.overlay_left, self.overlay_right, self.overlay_bottom):
+                w.raise_()
+                if user32:
+                    try:
+                        h = int(w.winId())
+                        if h:
+                            user32.SetWindowPos(
+                                wintypes.HWND(h),
+                                wintypes.HWND(HWND_TOP),
+                                0, 0, 0, 0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                            )
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -3450,10 +3474,6 @@ class MainWindow(QMainWindow):
                 "На вашем аккаунте 0 доступных запросов. Доступ заблокирован.",
                 error=True
             )
-            return
-
-        if hasattr(self, 'init_timer'):
-            self.init_timer.start(50)
 
     def _on_decrement(self):
         self._decrement_worker = DecrementWorker(self.token)
