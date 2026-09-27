@@ -43,6 +43,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QCheckBox, QDialog, QComboBox,
     QFormLayout, QMessageBox, QInputDialog, QGraphicsDropShadowEffect,
+    QSizePolicy,
 )
 from PyQt6.QtCore import QTimer, QThread, pyqtSignal, Qt, QPoint, QRectF
 from PyQt6.QtGui import (
