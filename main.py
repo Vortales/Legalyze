@@ -821,6 +821,7 @@ JS_DISABLE_DRAG = r"""
 # Микрофон: СТАРТ записи речи
 JS_START_RECORDING = r"""
 (() => {
+    // 1. Проверяем, не идет ли уже запись
     const isRecording = () => {
         const btns = Array.from(document.querySelectorAll('button, div[role="button"]'));
         for (const b of btns) {
@@ -834,20 +835,27 @@ JS_START_RECORDING = r"""
 
     if (isRecording()) return { ok: true, recording: true };
 
+    // 2. Поиск кнопки микрофона
     const findMic = () => {
-        const btns = Array.from(document.querySelectorAll('button, div[role="button"]'));
-        for (const b of btns) {
-            const label = (b.getAttribute('aria-label') || b.getAttribute('data-tooltip') || b.getAttribute('title') || b.innerText || '').toLowerCase();
-            if (label.includes('микрофон') || label.includes('microphon') || label.includes('голос') || label.includes('voice')) {
-                return b;
-            }
+        const selectors = [
+            'button[aria-label*="икрофон"]',
+            'button[aria-label*="icrophone"]',
+            'button[aria-label*="олос"]',
+            'button[aria-label*="oice"]',
+            'div[role="button"][aria-label*="икрофон"]',
+            'div[role="button"][aria-label*="icrophone"]'
+        ];
+        for (const sel of selectors) {
+            const el = document.querySelector(sel);
+            if (el && !el.disabled) return el;
         }
+
         const icons = Array.from(document.querySelectorAll('mat-icon, svg, i'));
         for (const ic of icons) {
             const name = (ic.getAttribute('data-mat-icon-name') || ic.getAttribute('data-icon') || ic.className || '').toLowerCase();
             if (name.includes('mic') || name.includes('voice')) {
                 const p = ic.closest('button, div[role="button"]');
-                if (p) return p;
+                if (p && !p.disabled) return p;
             }
         }
         return null;
@@ -864,6 +872,7 @@ JS_START_RECORDING = r"""
 # Микрофон: ОСТАНОВКА И ОТПРАВКА в чат
 JS_STOP_AND_SEND = r"""
 (() => {
+    // 1. Останавливаем микрофон, если активна кнопка остановки
     const stopBtns = Array.from(document.querySelectorAll('button, div[role="button"]'));
     for (const b of stopBtns) {
         const label = (b.getAttribute('aria-label') || b.getAttribute('data-tooltip') || b.getAttribute('title') || '').toLowerCase();
@@ -873,14 +882,21 @@ JS_STOP_AND_SEND = r"""
         }
     }
 
+    // 2. Поиск кнопки отправки запроса
     const findSendBtn = () => {
-        const btns = Array.from(document.querySelectorAll('button, div[role="button"]'));
-        for (const b of btns) {
-            const label = (b.getAttribute('aria-label') || b.getAttribute('data-tooltip') || b.getAttribute('title') || '').toLowerCase();
-            if (label.includes('отправ') || label.includes('send') || label.includes('submit')) {
-                if (!b.disabled && b.getAttribute('aria-disabled') !== 'true') return b;
-            }
+        const selectors = [
+            'button[aria-label="Отправить"]',
+            'button[aria-label*="тправить"]',
+            'button[aria-label*="end"]',
+            'button[aria-label*="ubmit"]',
+            'div[role="button"][aria-label*="тправить"]',
+            'div[role="button"][aria-label*="end"]'
+        ];
+        for (const sel of selectors) {
+            const el = document.querySelector(sel);
+            if (el && !el.disabled && el.getAttribute('aria-disabled') !== 'true') return el;
         }
+
         const icons = Array.from(document.querySelectorAll('mat-icon, svg, i'));
         for (const ic of icons) {
             const name = (ic.getAttribute('data-mat-icon-name') || ic.getAttribute('data-icon') || ic.className || '').toLowerCase();
@@ -901,22 +917,21 @@ JS_STOP_AND_SEND = r"""
         const inputEl = document.querySelector('textarea, div[contenteditable="true"], div[role="textbox"]');
         if (inputEl) {
             inputEl.focus();
-            const ev1 = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true });
-            const ev2 = new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true });
-            const ev3 = new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true });
-            inputEl.dispatchEvent(ev1);
-            inputEl.dispatchEvent(ev2);
-            inputEl.dispatchEvent(ev3);
+            const opts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
+            inputEl.dispatchEvent(new KeyboardEvent('keydown', opts));
+            inputEl.dispatchEvent(new KeyboardEvent('keypress', opts));
+            inputEl.dispatchEvent(new KeyboardEvent('keyup', opts));
             return true;
         }
         return false;
     };
 
+    // Даем паузу для финализации распознанного текста перед отправкой
     setTimeout(() => {
         if (!doSend()) {
             setTimeout(doSend, 300);
         }
-    }, 150);
+    }, 200);
 
     return { ok: true };
 })()
@@ -1979,27 +1994,14 @@ class HotkeyChip(QWidget):
 
         self.button = QPushButton(key)
         self.button.setFixedHeight(22)
-        self.button.setMinimumWidth(40)
+        self.button.setMinimumWidth(58)
+        self.button.setSizePolicy(QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Fixed)
         self.button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.button.setStyleSheet(f"""
-            QPushButton {{
-                background: rgba(124, 131, 255, 0.16);
-                color: #cdd2ff;
-                border: 1px solid rgba(124, 131, 255, 0.55);
-                border-radius: 6px;
-                font-size: 11px;
-                font-weight: 700;
-                padding: 1px 8px;
-            }}
-            QPushButton:hover {{ background: rgba(124, 131, 255, 0.34); color: #fff; }}
-        """)
+        self._apply_style(False)
         self.button.clicked.connect(self.clicked.emit)
         lay.addWidget(self.button)
 
-    def set_key(self, key: str):
-        self.button.setText(key)
-
-    def set_active(self, active: bool):
+    def _apply_style(self, active: bool):
         if not self.button.isEnabled():
             self.button.setStyleSheet("""
                 QPushButton {
@@ -2009,25 +2011,46 @@ class HotkeyChip(QWidget):
                     border-radius: 6px;
                     font-size: 11px;
                     font-weight: 700;
-                    padding: 1px 8px;
+                    padding: 1px 6px;
                 }
             """)
             return
 
-        color = THEME["ok"] if active else "rgba(124, 131, 255, 0.55)"
-        bg = "rgba(52, 211, 153, 0.22)" if active else "rgba(124, 131, 255, 0.16)"
-        self.button.setStyleSheet(f"""
-            QPushButton {{
-                background: {bg};
-                color: #e6e8f5;
-                border: 1px solid {color};
-                border-radius: 6px;
-                font-size: 11px;
-                font-weight: 700;
-                padding: 1px 8px;
-            }}
-            QPushButton:hover {{ background: rgba(124, 131, 255, 0.34); }}
-        """)
+        if active:
+            self.button.setStyleSheet(f"""
+                QPushButton {{
+                    background: rgba(52, 211, 153, 0.28);
+                    color: #a7f3d0;
+                    border: 1px solid {THEME['ok']};
+                    border-radius: 6px;
+                    font-size: 11px;
+                    font-weight: 700;
+                    padding: 1px 6px;
+                }}
+            """)
+        else:
+            self.button.setStyleSheet(f"""
+                QPushButton {{
+                    background: rgba(124, 131, 255, 0.16);
+                    color: #cdd2ff;
+                    border: 1px solid rgba(124, 131, 255, 0.55);
+                    border-radius: 6px;
+                    font-size: 11px;
+                    font-weight: 700;
+                    padding: 1px 6px;
+                }}
+                QPushButton:hover {{
+                    background: rgba(124, 131, 255, 0.32);
+                    border-color: rgba(124, 131, 255, 0.85);
+                    color: #ffffff;
+                }}
+            """)
+
+    def set_key(self, key: str):
+        self.button.setText(key)
+
+    def set_active(self, active: bool):
+        self._apply_style(active)
 
 
 class LoadingOverlay(QWidget):
@@ -2521,10 +2544,6 @@ class MainWindow(QMainWindow):
         self.topmost_timer.timeout.connect(self._enforce_topmost)
         self.topmost_timer.start(1200)
 
-        self.mic_sync_timer = QTimer(self)
-        self.mic_sync_timer.timeout.connect(self._sync_mic_state)
-        self.mic_sync_timer.start(1500)
-
     def _build_chrome_ui(self):
         panel = f"background-color: {THEME['panel']};"
         side_height = H - self.top_inset - self.bottom_inset
@@ -2573,7 +2592,7 @@ class MainWindow(QMainWindow):
         )
         brand.addWidget(title_label)
 
-        self.status_label = QLabel("подключение…")
+        self.status_label = QLabel("Подключение…")
         self.status_label.setStyleSheet(
             f"color: {THEME['muted']}; font-size: 9px; border: none;"
         )
@@ -2810,7 +2829,7 @@ class MainWindow(QMainWindow):
             self._hotkeys_registered = ok1 and ok2
 
             if not self._hotkeys_registered:
-                self._set_status("горячие клавиши заняты другой программой", "#f59e0b")
+                self._set_status("Конфликт горячих клавиш", "#f59e0b")
             return self._hotkeys_registered
         except Exception:
             return False
@@ -2841,7 +2860,7 @@ class MainWindow(QMainWindow):
                     chip.set_key(key)
         finally:
             if self._register_hotkeys():
-                self._set_status("готово", THEME["ok"])
+                self._set_status("Готов к работе", THEME["ok"])
 
     def _choose_hotkey(self):
         self._change_hotkey(
@@ -2924,41 +2943,28 @@ class MainWindow(QMainWindow):
             return
 
         now = time.monotonic()
-        if self._mic_busy or (now - self._mic_last_ts) < 0.4:
+        if self._mic_busy or (now - self._mic_last_ts) < 0.8:
             return
 
         self._mic_last_ts = now
         self._mic_busy = True
 
         def release(_value=None):
-            self._mic_busy = False
+            QTimer.singleShot(400, lambda: setattr(self, "_mic_busy", False))
 
         if not self.mic_active:
             # 1-е нажатие: старт записи речи
             self.mic_active = True
             self.chip_mic.set_active(True)
-            self._set_status("запись… (нажмите ещё раз для отправки)", THEME["ok"])
+            self._set_status("Запись голоса… (повтор: отправить)", THEME["ok"])
             self._page_eval_async(JS_START_RECORDING, 3, release)
         else:
             # 2-е нажатие: остановка записи и отправка в чат
             self.mic_active = False
             self.chip_mic.set_active(False)
-            self._set_status("отправка запроса…", THEME["accent"])
+            self._set_status("Отправка запроса…", THEME["accent"])
             self._page_eval_async(JS_STOP_AND_SEND, 4, release)
-
-    def _sync_mic_state(self):
-        if self._mic_busy or not self.worker or not getattr(self.worker, "page", None):
-            return
-
-        def apply(value):
-            if not isinstance(value, dict):
-                return
-            recording = bool(value.get("recording"))
-            if recording != self.mic_active:
-                self.mic_active = recording
-                self.chip_mic.set_active(recording)
-
-        self._page_eval_async(JS_MIC_STATE, 2, apply)
+            QTimer.singleShot(2500, lambda: self._set_status("Готов к работе", THEME["ok"]))
 
     def _open_template(self):
         overlay_was_visible = self.overlay.isVisible()
@@ -3072,12 +3078,12 @@ class MainWindow(QMainWindow):
         self.pdf_was_loaded_once = False
         self._last_attached_state = None
         self._set_dot("#f59e0b")
-        self._show_overlay("Обновление файлов", "Очистка предыдущих файлов…")
+        self._show_overlay("Синхронизация", "Обновление служебных файлов…")
         self._page_eval_async(JS_REMOVE_ALL_FILES, 3)
         QTimer.singleShot(650, lambda: self._load_prompt(force=True))
 
     def _start_chrome(self):
-        self._show_overlay("Инициализация", "Запуск защищённого браузера…")
+        self._show_overlay("Инициализация", "Запуск защищённого модуля…")
         self.worker = ChromeWorker()
         self.worker.hwnd_ready.connect(self._on_hwnd)
         self.worker.failed.connect(self._on_failed)
@@ -3122,7 +3128,7 @@ class MainWindow(QMainWindow):
             self.browser_placeholder.update()
 
             force_topmost(int(self.winId()))
-            self._set_status("браузер готов", THEME["ok"])
+            self._set_status("Готов к работе", THEME["ok"])
 
             self._load_prompt()
 
@@ -3211,19 +3217,18 @@ class MainWindow(QMainWindow):
         if attached:
             self.pdf_was_loaded_once = True
             self._set_dot(THEME["ok"])
-            self._set_status("промт + шаблон подключены", THEME["ok"])
+            self._set_status("Готов к работе", THEME["ok"])
             self._hide_overlay()
         else:
             self._set_dot("#f59e0b")
             if not self.pdf_was_loaded_once:
                 if self.pdf_path and Path(self.pdf_path).exists():
                     self._show_overlay(
-                        "Экспорт файлов...",
-                        f"Прикрепляем «{Path(self.pdf_path).name}» и «{TEMPLATE_EXPORT_NAME}». "
-                        "Ввод заблокирован, чтобы запрос не ушёл без файлов.",
+                        "Синхронизация данных",
+                        f"Подключение конфигурации и шаблона «{TEMPLATE_EXPORT_NAME}»…",
                     )
             else:
-                self._set_status("переприкрепление файлов...", "#f59e0b")
+                self._set_status("Синхронизация…", "#f59e0b")
 
     def _refresh_balance(self):
         self._balance_worker = BalanceWorker(self.token)
