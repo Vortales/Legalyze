@@ -13,7 +13,9 @@ Legalyze AI client — main.py (обновленная и оптимизиров
     через GetClientRect с сохранением оригинальных границ и отступов окна.
  5. Стандартный нативный browser zoom 67% через Preferences профиля Chromium (эквивалент ручного Ctrl + '-'),
     без искажения CSS-верстки и без смещения объектов влево.
- 6. Удалены сторонние браузеры (Playwright, системный Chrome, реестр), оставлен только portable Chromium рядом с exe.
+ 6. Микрофон: 1-е нажатие горячей клавиши — запуск записи речи, 2-е нажатие — остановка и отправка запроса в чат.
+ 7. Расширен список всех доступных клавиш клавиатуры (F1..F24, буквы, цифры, numpad, навигация, знаки, русская/английская раскладки).
+ 8. Окно «Шаблон»: при нажатии «Отмена» приложение возвращается к работе с главным окном без закрытия.
 """
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -274,54 +276,80 @@ def force_topmost(hwnd):
         pass
 
 
+# Полный список поддерживаемых клавиш (F1..F24, буквы, цифры, numpad, спецклавиши)
 VK_MAP = {
+    # Функциональные клавиши (F1 - F24)
     "F1": 0x70, "F2": 0x71, "F3": 0x72, "F4": 0x73, "F5": 0x74,
     "F6": 0x75, "F7": 0x76, "F8": 0x77, "F9": 0x78, "F10": 0x79,
-    "F11": 0x7A, "F12": 0x7B,
+    "F11": 0x7A, "F12": 0x7B, "F13": 0x7C, "F14": 0x7D, "F15": 0x7E,
+    "F16": 0x7F, "F17": 0x80, "F18": 0x81, "F19": 0x82, "F20": 0x83,
+    "F21": 0x84, "F22": 0x85, "F23": 0x86, "F24": 0x87,
 
+    # Буквы (A - Z)
     "A": 0x41, "B": 0x42, "C": 0x43, "D": 0x44, "E": 0x45, "F": 0x46,
     "G": 0x47, "H": 0x48, "I": 0x49, "J": 0x4A, "K": 0x4B, "L": 0x4C,
     "M": 0x4D, "N": 0x4E, "O": 0x4F, "P": 0x50, "Q": 0x51, "R": 0x52,
     "S": 0x53, "T": 0x54, "U": 0x55, "V": 0x56, "W": 0x57, "X": 0x58,
     "Y": 0x59, "Z": 0x5A,
 
+    # Цифры основного блока
     "0": 0x30, "1": 0x31, "2": 0x32, "3": 0x33, "4": 0x34,
     "5": 0x35, "6": 0x36, "7": 0x37, "8": 0x38, "9": 0x39,
 
+    # Цифровая клавиатура (Numpad)
     "Num0": 0x60, "Num1": 0x61, "Num2": 0x62, "Num3": 0x63,
     "Num4": 0x64, "Num5": 0x65, "Num6": 0x66, "Num7": 0x67,
     "Num8": 0x68, "Num9": 0x69,
+    "Num*": 0x6A, "Num+": 0x6B, "Num-": 0x6D, "Num.": 0x6E, "Num/": 0x6F,
 
+    # Управление и навигация
     "Space": 0x20, "Enter": 0x0D, "Tab": 0x09, "Esc": 0x1B,
+    "Backspace": 0x08, "CapsLock": 0x14, "ScrollLock": 0x91,
+    "Pause": 0x13, "PrintScreen": 0x2C,
+    "Insert": 0x2D, "Delete": 0x2E, "Home": 0x24, "End": 0x23,
+    "PageUp": 0x21, "PageDown": 0x22,
+    "Up": 0x26, "Down": 0x28, "Left": 0x25, "Right": 0x27,
 
+    # Символьные и пунктуационные клавиши
     "-": 0xBD, "=": 0xBB, "[": 0xDB, "]": 0xDD, "\\": 0xDC,
     ";": 0xBA, "'": 0xDE, ",": 0xBC, ".": 0xBE, "/": 0xBF,
     "`": 0xC0,
-
-    "Insert": 0x2D, "Delete": 0x2E, "Home": 0x24, "End": 0x23,
-    "PageUp": 0x21, "PageDown": 0x22,
-
-    "Up": 0x26, "Down": 0x28, "Left": 0x25, "Right": 0x27,
 }
 
 QT_KEY_TO_NAME = {}
-for _i in range(1, 13):
-    QT_KEY_TO_NAME[getattr(Qt.Key, f"Key_F{_i}")] = f"F{_i}"
+for _i in range(1, 25):
+    if hasattr(Qt.Key, f"Key_F{_i}"):
+        QT_KEY_TO_NAME[getattr(Qt.Key, f"Key_F{_i}")] = f"F{_i}"
 for _c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
-    QT_KEY_TO_NAME[getattr(Qt.Key, f"Key_{_c}")] = _c
+    if hasattr(Qt.Key, f"Key_{_c}"):
+        QT_KEY_TO_NAME[getattr(Qt.Key, f"Key_{_c}")] = _c
 for _d in "0123456789":
-    QT_KEY_TO_NAME[getattr(Qt.Key, f"Key_{_d}")] = _d
+    if hasattr(Qt.Key, f"Key_{_d}"):
+        QT_KEY_TO_NAME[getattr(Qt.Key, f"Key_{_d}")] = _d
+
 QT_KEY_TO_NAME.update({
     Qt.Key.Key_Space: "Space", Qt.Key.Key_Return: "Enter", Qt.Key.Key_Enter: "Enter",
-    Qt.Key.Key_Tab: "Tab", Qt.Key.Key_Insert: "Insert", Qt.Key.Key_Delete: "Delete",
-    Qt.Key.Key_Home: "Home", Qt.Key.Key_End: "End", Qt.Key.Key_PageUp: "PageUp",
-    Qt.Key.Key_PageDown: "PageDown", Qt.Key.Key_Up: "Up", Qt.Key.Key_Down: "Down",
-    Qt.Key.Key_Left: "Left", Qt.Key.Key_Right: "Right", Qt.Key.Key_Minus: "-",
-    Qt.Key.Key_Equal: "=", Qt.Key.Key_BracketLeft: "[", Qt.Key.Key_BracketRight: "]",
-    Qt.Key.Key_Backslash: "\\", Qt.Key.Key_Semicolon: ";", Qt.Key.Key_Apostrophe: "'",
-    Qt.Key.Key_Comma: ",", Qt.Key.Key_Period: ".", Qt.Key.Key_Slash: "/",
+    Qt.Key.Key_Tab: "Tab", Qt.Key.Key_Escape: "Esc", Qt.Key.Key_Backspace: "Backspace",
+    Qt.Key.Key_CapsLock: "CapsLock", Qt.Key.Key_ScrollLock: "ScrollLock",
+    Qt.Key.Key_Pause: "Pause", Qt.Key.Key_Print: "PrintScreen",
+    Qt.Key.Key_Insert: "Insert", Qt.Key.Key_Delete: "Delete",
+    Qt.Key.Key_Home: "Home", Qt.Key.Key_End: "End",
+    Qt.Key.Key_PageUp: "PageUp", Qt.Key.Key_PageDown: "PageDown",
+    Qt.Key.Key_Up: "Up", Qt.Key.Key_Down: "Down",
+    Qt.Key.Key_Left: "Left", Qt.Key.Key_Right: "Right",
+    Qt.Key.Key_Minus: "-", Qt.Key.Key_Equal: "=",
+    Qt.Key.Key_BracketLeft: "[", Qt.Key.Key_BracketRight: "]",
+    Qt.Key.Key_Backslash: "\\", Qt.Key.Key_Semicolon: ";",
+    Qt.Key.Key_Apostrophe: "'", Qt.Key.Key_Comma: ",",
+    Qt.Key.Key_Period: ".", Qt.Key.Key_Slash: "/",
     Qt.Key.Key_QuoteLeft: "`",
 })
+
+RU_TO_EN_KEY = {
+    'Й': 'Q', 'Ц': 'W', 'У': 'E', 'К': 'R', 'Е': 'T', 'Н': 'Y', 'Г': 'U', 'Ш': 'I', 'Щ': 'O', 'З': 'P', 'Х': '[', 'Ъ': ']',
+    'Ф': 'A', 'Ы': 'S', 'В': 'D', 'А': 'F', 'П': 'G', 'Р': 'H', 'О': 'J', 'Л': 'K', 'Д': 'L', 'Ж': ';', 'Э': "'",
+    'Я': 'Z', 'Ч': 'X', 'С': 'C', 'М': 'V', 'И': 'B', 'Т': 'N', 'Ь': 'M', 'Б': ',', 'Ю': '.', 'Ё': '`',
+}
 
 MODIFIER_MAP = {
     "Ctrl": 0x0002,
@@ -790,58 +818,120 @@ JS_DISABLE_DRAG = r"""
 })();
 """
 
-# Микрофон: только СТАРТ записи
-JS_CLICK_MIC = r"""
+# Микрофон: СТАРТ записи речи
+JS_START_RECORDING = r"""
 (() => {
-    const btn = document.querySelector('button[aria-label="Микрофон"]')
-             || document.querySelector('button[aria-label*="икрофон"]')
-             || document.querySelector('button[aria-label*="icrophon"]');
-    if (!btn) return { ok: false, reason: 'no-mic-button' };
-    btn.click();
-    setTimeout(() => {
-        if (document.activeElement === btn) btn.blur();
-        const ta = document.querySelector('textarea');
-        if (ta) { ta.focus(); ta.click(); }
-    }, 50);
+    const isRecording = () => {
+        const btns = Array.from(document.querySelectorAll('button, div[role="button"]'));
+        for (const b of btns) {
+            const label = (b.getAttribute('aria-label') || b.getAttribute('data-tooltip') || b.getAttribute('title') || '').toLowerCase();
+            if (label.includes('становить') || label.includes('stop listening') || b.getAttribute('aria-pressed') === 'true') {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    if (isRecording()) return { ok: true, recording: true };
+
+    const findMic = () => {
+        const btns = Array.from(document.querySelectorAll('button, div[role="button"]'));
+        for (const b of btns) {
+            const label = (b.getAttribute('aria-label') || b.getAttribute('data-tooltip') || b.getAttribute('title') || b.innerText || '').toLowerCase();
+            if (label.includes('микрофон') || label.includes('microphon') || label.includes('голос') || label.includes('voice')) {
+                return b;
+            }
+        }
+        const icons = Array.from(document.querySelectorAll('mat-icon, svg, i'));
+        for (const ic of icons) {
+            const name = (ic.getAttribute('data-mat-icon-name') || ic.getAttribute('data-icon') || ic.className || '').toLowerCase();
+            if (name.includes('mic') || name.includes('voice')) {
+                const p = ic.closest('button, div[role="button"]');
+                if (p) return p;
+            }
+        }
+        return null;
+    };
+
+    const mic = findMic();
+    if (!mic) return { ok: false, reason: 'no-mic-button' };
+
+    mic.click();
     return { ok: true };
 })()
 """
 
-# Отправка
-JS_CLICK_SEND = r"""
+# Микрофон: ОСТАНОВКА И ОТПРАВКА в чат
+JS_STOP_AND_SEND = r"""
 (() => {
-    const stopMic = document.querySelector('button[aria-label*="становить"]')
-                 || document.querySelector('button[aria-label*="top listening"]');
-    if (stopMic) { stopMic.click(); }
+    const stopBtns = Array.from(document.querySelectorAll('button, div[role="button"]'));
+    for (const b of stopBtns) {
+        const label = (b.getAttribute('aria-label') || b.getAttribute('data-tooltip') || b.getAttribute('title') || '').toLowerCase();
+        if (label.includes('становить') || label.includes('stop listening') || label.includes('stop') || b.getAttribute('aria-pressed') === 'true') {
+            try { b.click(); } catch(e) {}
+            break;
+        }
+    }
 
-    const send = () => {
-        const btn = document.querySelector('button[aria-label="Отправить"]')
-                 || document.querySelector('button[aria-label*="тправ"]')
-                 || document.querySelector('button[aria-label*="end"]');
-        if (btn && !btn.disabled) {
+    const findSendBtn = () => {
+        const btns = Array.from(document.querySelectorAll('button, div[role="button"]'));
+        for (const b of btns) {
+            const label = (b.getAttribute('aria-label') || b.getAttribute('data-tooltip') || b.getAttribute('title') || '').toLowerCase();
+            if (label.includes('отправ') || label.includes('send') || label.includes('submit')) {
+                if (!b.disabled && b.getAttribute('aria-disabled') !== 'true') return b;
+            }
+        }
+        const icons = Array.from(document.querySelectorAll('mat-icon, svg, i'));
+        for (const ic of icons) {
+            const name = (ic.getAttribute('data-mat-icon-name') || ic.getAttribute('data-icon') || ic.className || '').toLowerCase();
+            if (name.includes('send') || name.includes('submit')) {
+                const p = ic.closest('button, div[role="button"]');
+                if (p && !p.disabled && p.getAttribute('aria-disabled') !== 'true') return p;
+            }
+        }
+        return null;
+    };
+
+    const doSend = () => {
+        const btn = findSendBtn();
+        if (btn) {
             btn.click();
-            setTimeout(() => {
-                if (document.activeElement === btn) btn.blur();
-                const ta = document.querySelector('textarea');
-                if (ta) { ta.focus(); ta.click(); }
-            }, 50);
+            return true;
+        }
+        const inputEl = document.querySelector('textarea, div[contenteditable="true"], div[role="textbox"]');
+        if (inputEl) {
+            inputEl.focus();
+            const ev1 = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true });
+            const ev2 = new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true });
+            const ev3 = new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true });
+            inputEl.dispatchEvent(ev1);
+            inputEl.dispatchEvent(ev2);
+            inputEl.dispatchEvent(ev3);
             return true;
         }
         return false;
     };
 
-    if (send()) return { ok: true };
-    setTimeout(send, 250);
-    return { ok: true, deferred: true };
+    setTimeout(() => {
+        if (!doSend()) {
+            setTimeout(doSend, 300);
+        }
+    }, 150);
+
+    return { ok: true };
 })()
 """
 
 JS_MIC_STATE = r"""
 (() => {
-    const rec = document.querySelector('button[aria-label*="становить"]')
-             || document.querySelector('button[aria-label*="top listening"]')
-             || document.querySelector('button[aria-pressed="true"][aria-label*="икрофон"]');
-    return { recording: !!rec };
+    const btns = Array.from(document.querySelectorAll('button, div[role="button"]'));
+    for (const b of btns) {
+        const label = (b.getAttribute('aria-label') || b.getAttribute('data-tooltip') || b.getAttribute('title') || '').toLowerCase();
+        if (label.includes('становить') || label.includes('stop listening') || b.getAttribute('aria-pressed') === 'true') {
+            return { recording: true };
+        }
+    }
+    return { recording: false };
 })()
 """
 
@@ -1465,8 +1555,8 @@ class PromptLoaderWorker(QThread):
 class LoginWindow(QDialog):
     login_success = pyqtSignal(dict, str, dict)
 
-    def __init__(self, cfg):
-        super().__init__()
+    def __init__(self, cfg, parent=None):
+        super().__init__(parent)
         self.cfg = cfg
 
         self.setWindowTitle("Legalyze — Авторизация")
@@ -1477,6 +1567,7 @@ class LoginWindow(QDialog):
             | Qt.WindowType.Dialog
         )
         self.setStyleSheet(BASE_QSS)
+        self.setModal(True)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(28, 24, 28, 24)
@@ -1629,8 +1720,8 @@ class TemplateWindow(QDialog):
         ("JobTitle", "Должность", "Заместитель командующего MP, сенатор NG"),
     ]
 
-    def __init__(self, cfg, token=""):
-        super().__init__()
+    def __init__(self, cfg, token="", parent=None):
+        super().__init__(parent)
         self.cfg = cfg
         self.token = token
         self.setWindowTitle("Шаблон данных")
@@ -1641,6 +1732,7 @@ class TemplateWindow(QDialog):
             | Qt.WindowType.Dialog
         )
         self.setStyleSheet(BASE_QSS)
+        self.setModal(True)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(30, 26, 30, 24)
@@ -1814,10 +1906,31 @@ class HotkeyDialog(QDialog):
             self.reject()
             return
 
-        name = QT_KEY_TO_NAME.get(key)
+        name = None
+        # 1. Попытка определить по аппаратному коду клавиши Windows (Win32 Virtual Key)
+        # Это работает одинаково надежно на любой раскладке клавиатуры
+        try:
+            vk = event.nativeVirtualKey()
+            if vk:
+                for k, code in VK_MAP.items():
+                    if code == vk:
+                        name = k
+                        break
+        except Exception:
+            pass
+
+        # 2. Попытка определить через Qt Key enum
         if not name:
-            seq = QKeySequence(event.key()).toString().upper()
-            name = seq if seq in VK_MAP else None
+            name = QT_KEY_TO_NAME.get(key)
+
+        # 3. Попытка сопоставить через русско-английскую раскладку
+        if not name:
+            ru_char = event.text().upper()
+            mapped = RU_TO_EN_KEY.get(ru_char)
+            if mapped and mapped in VK_MAP:
+                name = mapped
+            elif ru_char in VK_MAP:
+                name = ru_char
 
         if not name:
             self.error.setText("Эта клавиша не поддерживается")
@@ -2265,7 +2378,7 @@ class UploadThread(QThread):
 
 
 class PromptSelectionWindow(QDialog):
-    def __init__(self, items, display_names, current_index, parent):
+    def __init__(self, items, display_names, current_index, parent=None):
         super().__init__(parent)
         self.items = items
         self.choice = None
@@ -2278,6 +2391,7 @@ class PromptSelectionWindow(QDialog):
             | Qt.WindowType.Dialog
         )
         self.setStyleSheet(BASE_QSS)
+        self.setModal(True)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 16, 18, 16)
@@ -2468,8 +2582,9 @@ class MainWindow(QMainWindow):
 
         top_layout.addStretch()
 
+        # ── чипы горячих клавиш с подписями ──
         self.chip_mic = HotkeyChip("Микрофон", self.cfg.get("hotkey_mic", "F3"))
-        self.chip_mic.button.setEnabled(False)
+        self.chip_mic.button.setEnabled(True)
         self.chip_mic.clicked.connect(self._choose_mic_hotkey)
         top_layout.addWidget(self.chip_mic)
 
@@ -2805,14 +2920,11 @@ class MainWindow(QMainWindow):
         threading.Thread(target=task, daemon=True).start()
 
     def _toggle_mic(self):
-        if not self.chip_mic.button.isEnabled():
-            return
-
         if not self.worker or not getattr(self.worker, "page", None):
             return
 
         now = time.monotonic()
-        if self._mic_busy or (now - self._mic_last_ts) < 0.45:
+        if self._mic_busy or (now - self._mic_last_ts) < 0.4:
             return
 
         self._mic_last_ts = now
@@ -2822,15 +2934,17 @@ class MainWindow(QMainWindow):
             self._mic_busy = False
 
         if not self.mic_active:
+            # 1-е нажатие: старт записи речи
             self.mic_active = True
             self.chip_mic.set_active(True)
             self._set_status("запись… (нажмите ещё раз для отправки)", THEME["ok"])
-            self._page_eval_async(JS_CLICK_MIC, 3, release)
+            self._page_eval_async(JS_START_RECORDING, 3, release)
         else:
+            # 2-е нажатие: остановка записи и отправка в чат
             self.mic_active = False
             self.chip_mic.set_active(False)
             self._set_status("отправка запроса…", THEME["accent"])
-            self._page_eval_async(JS_CLICK_SEND, 3, release)
+            self._page_eval_async(JS_STOP_AND_SEND, 4, release)
 
     def _sync_mic_state(self):
         if self._mic_busy or not self.worker or not getattr(self.worker, "page", None):
@@ -2847,8 +2961,19 @@ class MainWindow(QMainWindow):
         self._page_eval_async(JS_MIC_STATE, 2, apply)
 
     def _open_template(self):
-        dlg = TemplateWindow(self.cfg, token=self.token)
-        if dlg.exec():
+        overlay_was_visible = self.overlay.isVisible()
+        if overlay_was_visible:
+            self.overlay.hide()
+
+        dlg = TemplateWindow(self.cfg, token=self.token, parent=self)
+        dialog_result = dlg.exec()
+
+        if overlay_was_visible:
+            self.overlay.show()
+            self.overlay.sync_geometry()
+            force_topmost(int(self.overlay.winId()))
+
+        if dialog_result == QDialog.DialogCode.Accepted:
             save_template(self.cfg, dlg.get_template())
             self._reload_prompt()
 
@@ -3312,6 +3437,7 @@ def main():
     purge_plaintext_artifacts(DATA_DIR)
 
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
     app.setStyleSheet(BASE_QSS)
 
     if not resolve_browser_path():
