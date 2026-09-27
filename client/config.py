@@ -84,7 +84,7 @@ TEMPLATE_FILE = APP_DIR / "Шаблон.txt"
 RESOURCE_DIR = _bundle_dir()
 BUNDLE_DATA_DIR = RESOURCE_DIR / "data"
 ENCRYPTION_KEY = b"legalyze-fernet-key-32bytes-long!"
-SERVER_URL = "http://45.153.189.128:3000"
+SERVER_URL = "https://legalyzeai.ru"
 CURRENT_VERSION = "1.0.0"
 
 # Порядок полей в Шаблон.txt (фиксированный, менять нельзя).
