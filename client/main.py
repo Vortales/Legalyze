@@ -823,60 +823,19 @@ JS_DISABLE_DRAG = r"""
 # Микрофон: СТАРТ записи речи (ТЗ п.1)
 JS_START_RECORDING = r"""
 (() => {
-    const fireClick = (el) => {
-        if (!el) return false;
-        try { el.focus(); } catch(e) {}
-        try { el.click(); } catch(e) {}
-        const rect = el.getBoundingClientRect();
-        const cx = rect.left + rect.width / 2;
-        const cy = rect.top + rect.height / 2;
-        const evOpts = {
-            bubbles: true,
-            cancelable: true,
-            view: window,
-            clientX: cx,
-            clientY: cy,
-            button: 0,
-            buttons: 1
-        };
-        try { el.dispatchEvent(new MouseEvent('mousedown', evOpts)); } catch(e) {}
-        try { el.dispatchEvent(new MouseEvent('mouseup', evOpts)); } catch(e) {}
-        try { el.dispatchEvent(new MouseEvent('click', evOpts)); } catch(e) {}
-        return true;
-    };
-
-    const isRecording = () => {
-        // ТЗ п.2: проверка «Преобразование речи в текст…»
-        const textEls = document.querySelectorAll('.pRjbAe, [aria-live="polite"], div');
-        for (const el of textEls) {
-            if (el.innerText && el.innerText.includes('Преобразование речи')) return true;
-        }
-        // ТЗ п.2: проверка анимированных волн записи
-        if (document.querySelector('.tFTltc, .S7I6ve, .S34Aff, .r5nqdd')) return true;
-        // ТЗ п.3: проверка кнопки отправки голосовой записи
-        if (document.querySelector('button[data-xid="input-plate-voice-send-button"]')) return true;
-        // Проверка скрытия textarea при активной записи
-        const ta = document.querySelector('textarea.ITIRGe, textarea[aria-label="Задайте вопрос"]');
-        if (ta && (ta.hidden || ta.style.display === 'none')) return true;
-        return false;
-    };
-
-    if (isRecording()) {
-        return { ok: true, recording: true };
-    }
-
-    // ТЗ п.1: поиск кнопки микрофона для старта записи
-    const findMicBtn = () => {
+    const findMic = () => {
+        // Точные селекторы кнопки микрофона
         const selectors = [
+            'button[aria-label="Микрофон"]',
+            'button.vpw7Fc',
+            'button[data-xid="h4gG8"]',
+            'button.uMMzHc.vpw7Fc',
             'button[data-xid="input-plate-voice-button"]',
-            'button[data-xid="input-plate-mic-button"]',
-            'button[data-xid*="voice"]:not([data-xid*="send"])',
-            'button[data-xid*="mic"]',
             'button[aria-label*="икрофон" i]',
             'button[aria-label*="олос" i]',
             'button[aria-label*="дикт" i]',
             'button[aria-label*="icrophone" i]',
-            'button[aria-label*="oice" i]:not([aria-label*="send" i])',
+            'button[aria-label*="oice" i]:not([aria-label*="send" i]):not([aria-label*="тправ" i])',
             'div[role="button"][aria-label*="икрофон" i]',
             'div[role="button"][aria-label*="icrophone" i]'
         ];
@@ -895,6 +854,7 @@ JS_START_RECORDING = r"""
             }
         }
 
+        // Поиск по SVG path
         const paths = Array.from(document.querySelectorAll('svg path'));
         for (const p of paths) {
             const d = p.getAttribute('d') || '';
@@ -903,14 +863,36 @@ JS_START_RECORDING = r"""
                 if (btn && !(btn.getAttribute('data-xid') || '').includes('send')) return btn;
             }
         }
+
         return null;
     };
 
-    const micBtn = findMicBtn();
-    if (!micBtn) return { ok: false, reason: 'no-mic-btn' };
+    const el = findMic();
+    if (!el) return { ok: false, reason: 'not_found' };
 
-    fireClick(micBtn);
-    return { ok: true };
+    try { el.focus(); } catch(e) {}
+    const rect = el.getBoundingClientRect();
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+
+    const evOpts = {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+        clientX: x,
+        clientY: y,
+        button: 0,
+        buttons: 1
+    };
+
+    try { el.dispatchEvent(new PointerEvent('pointerdown', { ...evOpts, pointerId: 1, pointerType: 'mouse', isPrimary: true, pressure: 0.5 })); } catch(e) {}
+    try { el.dispatchEvent(new MouseEvent('mousedown', evOpts)); } catch(e) {}
+    try { el.dispatchEvent(new PointerEvent('pointerup', { ...evOpts, pointerId: 1, pointerType: 'mouse', isPrimary: true, buttons: 0, pressure: 0 })); } catch(e) {}
+    try { el.dispatchEvent(new MouseEvent('mouseup', { ...evOpts, buttons: 0 })); } catch(e) {}
+    try { el.dispatchEvent(new MouseEvent('click', { ...evOpts, buttons: 0 })); } catch(e) {}
+    try { el.click(); } catch(e) {}
+
+    return { ok: true, x: x, y: y };
 })()
 """
 
@@ -933,42 +915,17 @@ JS_CHECK_RECORDING = r"""
 # Микрофон: ОТПРАВКА голосовой записи в ИИ чат (ТЗ п.3)
 JS_STOP_AND_SEND = r"""
 (() => {
-    const fireClick = (el) => {
-        if (!el) return false;
-        try { el.disabled = false; } catch(e) {}
-        try { el.removeAttribute('disabled'); } catch(e) {}
-        try { el.setAttribute('aria-disabled', 'false'); } catch(e) {}
-        try { el.focus(); } catch(e) {}
-        try { el.click(); } catch(e) {}
-        const rect = el.getBoundingClientRect();
-        const cx = rect.left + rect.width / 2;
-        const cy = rect.top + rect.height / 2;
-        const evOpts = {
-            bubbles: true,
-            cancelable: true,
-            view: window,
-            clientX: cx,
-            clientY: cy,
-            button: 0,
-            buttons: 1
-        };
-        try { el.dispatchEvent(new MouseEvent('mousedown', evOpts)); } catch(e) {}
-        try { el.dispatchEvent(new MouseEvent('mouseup', evOpts)); } catch(e) {}
-        try { el.dispatchEvent(new MouseEvent('click', evOpts)); } catch(e) {}
-        return true;
-    };
-
-    // Поиск кнопки отправки голосовой записи (ТЗ п.3: data-xid="input-plate-voice-send-button")
-    const findVoiceSendBtn = () => {
-        const primary = document.querySelector('button[data-xid="input-plate-voice-send-button"]');
-        if (primary) return primary;
-
+    const findSend = () => {
         const selectors = [
+            'button[data-xid="input-plate-voice-send-button"]',
+            'button.wdK4Nc',
             'button[aria-label="Отправить"]',
+            'button.uMMzHc.wdK4Nc',
             'button[data-xid*="voice-send"]',
             'button[data-xid*="send"]',
             'button[aria-label*="тправить" i]',
             'button[aria-label*="end" i]',
+            'button[aria-label*="ubmit" i]',
             'div[role="button"][aria-label*="тправить" i]'
         ];
         for (const sel of selectors) {
@@ -987,29 +944,48 @@ JS_STOP_AND_SEND = r"""
         return null;
     };
 
-    const doSend = () => {
-        const btn = findVoiceSendBtn();
-        if (btn) {
-            fireClick(btn);
-            return true;
-        }
+    const el = findSend();
+    if (!el) {
+        // Fallback: Enter в поле ввода
         const inputEl = document.querySelector('textarea, div[contenteditable="true"], div[role="textbox"]');
         if (inputEl) {
-            inputEl.focus();
+            try { inputEl.focus(); } catch(e) {}
             const opts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
             inputEl.dispatchEvent(new KeyboardEvent('keydown', opts));
             inputEl.dispatchEvent(new KeyboardEvent('keypress', opts));
             inputEl.dispatchEvent(new KeyboardEvent('keyup', opts));
-            return true;
+            return { ok: true, fallback: 'enter' };
         }
-        return false;
+        return { ok: false, reason: 'not_found' };
+    }
+
+    try { el.disabled = false; } catch(e) {}
+    try { el.removeAttribute('disabled'); } catch(e) {}
+    try { el.setAttribute('aria-disabled', 'false'); } catch(e) {}
+    try { el.focus(); } catch(e) {}
+
+    const rect = el.getBoundingClientRect();
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+
+    const evOpts = {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+        clientX: x,
+        clientY: y,
+        button: 0,
+        buttons: 1
     };
 
-    doSend();
-    setTimeout(doSend, 120);
-    setTimeout(doSend, 300);
+    try { el.dispatchEvent(new PointerEvent('pointerdown', { ...evOpts, pointerId: 1, pointerType: 'mouse', isPrimary: true, pressure: 0.5 })); } catch(e) {}
+    try { el.dispatchEvent(new MouseEvent('mousedown', evOpts)); } catch(e) {}
+    try { el.dispatchEvent(new PointerEvent('pointerup', { ...evOpts, pointerId: 1, pointerType: 'mouse', isPrimary: true, buttons: 0, pressure: 0 })); } catch(e) {}
+    try { el.dispatchEvent(new MouseEvent('mouseup', { ...evOpts, buttons: 0 })); } catch(e) {}
+    try { el.dispatchEvent(new MouseEvent('click', { ...evOpts, buttons: 0 })); } catch(e) {}
+    try { el.click(); } catch(e) {}
 
-    return { ok: true };
+    return { ok: true, x: x, y: y };
 })()
 """
 
@@ -3001,6 +2977,17 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=task, daemon=True).start()
 
+    def _cdp_click_coords(self, x, y):
+        page = getattr(self.worker, "page", None) if self.worker else None
+        if not page or x is None or y is None:
+            return
+        try:
+            page.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": float(x), "y": float(y)}, timeout=2)
+            page.send("Input.dispatchMouseEvent", {"type": "mousePressed", "button": "left", "x": float(x), "y": float(y), "clickCount": 1}, timeout=2)
+            page.send("Input.dispatchMouseEvent", {"type": "mouseReleased", "button": "left", "x": float(x), "y": float(y), "clickCount": 1}, timeout=2)
+        except Exception:
+            pass
+
     def _toggle_mic(self):
         if not self.worker or not getattr(self.worker, "page", None):
             return
@@ -3021,14 +3008,24 @@ class MainWindow(QMainWindow):
             self.mic_active = True
             self.chip_mic.set_active(True)
             self._set_status("Запись голоса… (повтор: отправить)", THEME["ok"])
-            self._page_eval_async(JS_START_RECORDING, timeout=3)
+
+            def on_mic_eval(val):
+                if isinstance(val, dict) and "x" in val and "y" in val:
+                    self._cdp_click_coords(val["x"], val["y"])
+
+            self._page_eval_async(JS_START_RECORDING, timeout=3, callback=on_mic_eval)
         else:
             # 2-е нажатие: отправка запроса в чат ИИ (п.3 ТЗ)
             self.mic_active = False
             self.chip_mic.set_active(False)
             self._set_status("Отправка запроса…", THEME["accent"])
-            self._page_eval_async(JS_STOP_AND_SEND, timeout=3)
-            QTimer.singleShot(2500, lambda: self._set_status("Готов к работе", THEME["ok"]))
+
+            def on_send_eval(val):
+                if isinstance(val, dict) and "x" in val and "y" in val:
+                    self._cdp_click_coords(val["x"], val["y"])
+                QTimer.singleShot(2500, lambda: self._set_status("Готов к работе", THEME["ok"]))
+
+            self._page_eval_async(JS_STOP_AND_SEND, timeout=3, callback=on_send_eval)
 
     def _open_template(self):
         overlay_was_visible = self.overlay.isVisible()
