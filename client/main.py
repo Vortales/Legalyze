@@ -10,8 +10,9 @@ Legalyze AI client — main.py (обновленная и оптимизиров
  2. Полностью убраны консольные окна при запуске и работе приложения (CREATE_NO_WINDOW + STARTUPINFO SW_HIDE).
  3. Обновлены значения шаблона по умолчанию и подсказок (Mike Macmillan, 85028, SANG, 11, MP, Заместитель командующего MP, сенатор NG).
  4. Адаптация браузера под любое разрешение и DPI-масштабирование (100%, 125%, 150%, 175%, 200%)
-    через GetClientRect и автоматическую синхронизацию геометрии в _sync_chrome_geometry.
- 5. Стандартный zoom страницы 67% при первом и последующих запусках (через addScriptToEvaluateOnNewDocument и CSS/JS).
+    через GetClientRect с сохранением оригинальных границ и отступов окна.
+ 5. Стандартный нативный browser zoom 67% через Preferences профиля Chromium (эквивалент ручного Ctrl + '-'),
+    без искажения CSS-верстки и без смещения объектов влево.
  6. Удалены сторонние браузеры (Playwright, системный Chrome, реестр), оставлен только portable Chromium рядом с exe.
 """
 import urllib3
@@ -484,9 +485,50 @@ def _free_port():
     return port
 
 
+def _set_browser_zoom_preferences(profile_dir: Path):
+    """
+    Устанавливает нативный browser zoom 67% (-2.2239) в настройках профиля Chromium.
+    Это абсолютно идентично ручному нажатию Ctrl + '-' до 67% в браузере.
+    Не ломает CSS-разметку, сохраняет исходное центрирование элементов и отступы (ТЗ п.5).
+    """
+    ZOOM_67 = -2.223901614059533
+    for sub in ("Default", ""):
+        target_dir = profile_dir / sub if sub else profile_dir
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            prefs_file = target_dir / "Preferences"
+            prefs = {}
+            if prefs_file.exists():
+                try:
+                    prefs = json.loads(prefs_file.read_text(encoding="utf-8"))
+                    if not isinstance(prefs, dict):
+                        prefs = {}
+                except Exception:
+                    prefs = {}
+
+            partition = prefs.setdefault("partition", {})
+            partition["default_zoom_level"] = {"x": ZOOM_67}
+            per_host = partition.setdefault("per_host_zoom_levels", {}).setdefault("x", {})
+            for host in ("google.com", "www.google.com", "gemini.google.com", "accounts.google.com"):
+                per_host[host] = ZOOM_67
+
+            profile = prefs.setdefault("profile", {})
+            profile["default_zoom_level"] = {"x": ZOOM_67}
+            prof_per_host = profile.setdefault("per_host_zoom_levels", {}).setdefault("x", {})
+            for host in ("google.com", "www.google.com", "gemini.google.com", "accounts.google.com"):
+                prof_per_host[host] = ZOOM_67
+
+            tmp_file = prefs_file.with_name(prefs_file.name + ".tmp")
+            tmp_file.write_text(json.dumps(prefs, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp_file.replace(prefs_file)
+        except Exception:
+            pass
+
+
 def launch_chrome():
     port = _free_port()
     PROFILE.mkdir(parents=True, exist_ok=True)
+    _set_browser_zoom_preferences(PROFILE)
 
     browser_path = resolve_browser_path()
     if not browser_path:
@@ -601,36 +643,6 @@ def grant_mic_permission(browser: CDP, page: CDP):
         except Exception:
             pass
 
-
-# --------------------------------------------------------------------------- #
-#  Zoom 67% по стандарту (ТЗ п.5)
-# --------------------------------------------------------------------------- #
-JS_ZOOM = r"""
-(() => {
-    const applyZoom = () => {
-        try {
-            if (document.documentElement) {
-                document.documentElement.style.setProperty('zoom', '67%', 'important');
-            }
-            if (document.body) {
-                document.body.style.setProperty('zoom', '67%', 'important');
-            }
-        } catch (e) {}
-    };
-    applyZoom();
-    document.addEventListener('DOMContentLoaded', applyZoom);
-    window.addEventListener('load', applyZoom);
-    try {
-        const styleId = '__legalyze_zoom_style__';
-        if (!document.getElementById(styleId)) {
-            const style = document.createElement('style');
-            style.id = styleId;
-            style.innerHTML = 'html, body { zoom: 67% !important; }';
-            (document.head || document.documentElement).appendChild(style);
-        }
-    } catch (e) {}
-})();
-"""
 
 JS_PURGE = r"""
 (() => {
@@ -872,7 +884,7 @@ JS_CHECK_END = r"""
 
 
 def install_purge(page: CDP):
-    for src in (JS_DISABLE_CONTEXT_MENU, JS_DISABLE_DRAG, JS_PURGE, JS_ZOOM):
+    for src in (JS_DISABLE_CONTEXT_MENU, JS_DISABLE_DRAG, JS_PURGE):
         try:
             page.send("Page.addScriptToEvaluateOnNewDocument", {"source": src}, timeout=5)
         except Exception:
@@ -883,7 +895,7 @@ def install_purge(page: CDP):
     except Exception:
         pass
 
-    for src in (JS_DISABLE_CONTEXT_MENU, JS_DISABLE_DRAG, JS_PURGE, JS_ZOOM):
+    for src in (JS_DISABLE_CONTEXT_MENU, JS_DISABLE_DRAG, JS_PURGE):
         try:
             page.eval(src, timeout=5)
         except Exception:
@@ -2083,12 +2095,6 @@ class ChromeWorker(QThread):
 
             grant_mic_permission(self.browser, self.page)
 
-            # Применяем масштаб 67%
-            try:
-                self.page.eval(JS_ZOOM, timeout=5)
-            except Exception:
-                pass
-
             hwnd = None
             for _ in range(200):
                 pids = {self.proc.pid}
@@ -2633,7 +2639,7 @@ class MainWindow(QMainWindow):
     def _sync_chrome_geometry(self):
         """
         Адаптация встроенного браузера под текущее разрешение и DPI-масштаб Windows (ТЗ п.4).
-        Использует GetClientRect для точного соответствия физическим пикселям контейнера.
+        Сохраняет исходное выравнивание и границы (-10px x-offset для скрытия системной рамки).
         """
         if not getattr(self, "chrome_hwnd", None) or not self.browser_placeholder or not user32:
             return
@@ -2653,15 +2659,13 @@ class MainWindow(QMainWindow):
 
             dpr = self.devicePixelRatioF() if hasattr(self, "devicePixelRatioF") else 1.0
             x_offset = int(-10 * dpr)
-            chrome_w = p_width - x_offset + int(10 * dpr)
-            chrome_h = p_height
 
             user32.SetWindowPos(
                 wintypes.HWND(int(self.chrome_hwnd)),
                 wintypes.HWND(HWND_TOP),
                 x_offset, 0,
-                chrome_w,
-                chrome_h,
+                p_width,
+                p_height,
                 SWP_FRAMECHANGED | SWP_NOACTIVATE,
             )
         except Exception:
