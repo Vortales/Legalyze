@@ -1291,6 +1291,10 @@ def find_chrome_hwnd(pids):
             user32.GetClassNameW(hwnd, buf, 256)
             cls = buf.value
 
+            buf_title = ctypes.create_unicode_buffer(512)
+            user32.GetWindowTextW(hwnd, buf_title, 512)
+            title = buf_title.value.lower()
+
             if cls in ("Chrome_WidgetWin_1", "Chrome_WidgetWin_0"):
                 is_our_pid = pid.value in pids if pids else False
 
@@ -1300,19 +1304,22 @@ def find_chrome_hwnd(pids):
                 height = max(0, rect.bottom - rect.top)
                 area = width * height
 
-                is_visible = bool(user32.IsWindowVisible(hwnd))
-
                 score = 0
                 if is_our_pid:
-                    score += 1000
-                if is_visible:
-                    score += 500
-                if width >= 200 and height >= 200:
-                    score += 300
+                    score += 2000
                 if cls == "Chrome_WidgetWin_1":
+                    score += 1000
+                if any(k in title for k in ["google", "ai", "gemini"]):
+                    score += 800
+                if width >= 200 and height >= 200:
+                    score += 500
+                if width > 0 and height > 0:
                     score += 100
 
-                if area > 10000 or (is_our_pid and area > 1000):
+                # Исключаем окна 0x0
+                if is_our_pid and (width > 50 or cls == "Chrome_WidgetWin_1"):
+                    candidates.append((score, area, int(hwnd)))
+                elif not is_our_pid and area > 10000 and cls == "Chrome_WidgetWin_1":
                     candidates.append((score, area, int(hwnd)))
         except Exception:
             pass
@@ -2965,7 +2972,7 @@ class MainWindow(QMainWindow):
                 x_offset, 0,
                 p_width,
                 p_height,
-                SWP_FRAMECHANGED | SWP_NOACTIVATE,
+                SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW,
             )
         except Exception:
             pass
@@ -3293,7 +3300,7 @@ class MainWindow(QMainWindow):
             if user32:
                 parent_hwnd = int(self.browser_placeholder.winId())
                 if parent_hwnd:
-                    user32.SetParent(hwnd, parent_hwnd)
+                    user32.SetParent(wintypes.HWND(int(hwnd)), wintypes.HWND(int(parent_hwnd)))
 
                 style = get_window_long(hwnd, GWL_STYLE)
                 style &= ~(
@@ -3313,7 +3320,7 @@ class MainWindow(QMainWindow):
                 exstyle &= 0xFFFFFFFF
                 set_window_long(hwnd, GWL_EXSTYLE, exstyle)
 
-                user32.ShowWindow(hwnd, SW_SHOW)
+                user32.ShowWindow(wintypes.HWND(int(hwnd)), SW_SHOW)
                 self._sync_chrome_geometry()
 
             self.browser_placeholder.update()
