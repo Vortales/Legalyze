@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.build/
+*.dist/
+*.onefile-build/
+chromium/
+logs/
+*.log
+config.json
+Шаблон.txt
