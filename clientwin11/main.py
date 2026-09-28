@@ -8,6 +8,7 @@ from diagnostics import stage
 import win32_diagnostics as native_diag
 import browser_focus
 import storage_paths
+import browser_process
 
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -613,6 +614,15 @@ def _set_browser_zoom_preferences(profile_dir: Path):
 @stage
 def launch_chrome():
     profile = PROFILE
+    policy = browser_process.launch_policy()
+    diag.event("chromium.launch_policy", **policy)
+    if policy["desktop_token"]:
+        # Check BEFORE launch: a post-launch list cannot distinguish an old
+        # singleton from a new browser created by Chromium's auto-de-elevation.
+        owners = storage_paths.busy_windows_paths([profile])
+        diag.event("chromium.profile_before_launch", pids=owners)
+        if owners:
+            raise browser_process.ProfileInUseError(owners)
     port = _free_port()
     profile.mkdir(parents=True, exist_ok=True)
     _set_browser_zoom_preferences(profile)
@@ -663,9 +673,15 @@ def launch_chrome():
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = 4  # SW_SHOWNOACTIVATE, not SW_HIDE: keep _1 discoverable.
     diag.event("chromium.launch", executable=browser_path, args=args, profile=str(profile), port=port)
-    with open(diag.LOG_DIR / "chromium-stdout.log", "ab") as stdout, open(diag.LOG_DIR / "chromium-stderr.log", "ab") as stderr:
-        proc = subprocess.Popen(args, stdout=stdout, stderr=stderr,
-                                creationflags=creationflags, startupinfo=startupinfo)
+    if policy["desktop_token"]:
+        proc = browser_process.launch_unelevated(args)
+        diag.event("chromium.desktop_token_launch", browser_pid=proc.pid,
+                   same_user=True, same_session=True, elevated=False,
+                   stdio_captured=False, native_log=str(diag.LOG_DIR / "chromium.log"))
+    else:
+        with open(diag.LOG_DIR / "chromium-stdout.log", "ab") as stdout, open(diag.LOG_DIR / "chromium-stderr.log", "ab") as stderr:
+            proc = subprocess.Popen(args, stdout=stdout, stderr=stderr,
+                                    creationflags=creationflags, startupinfo=startupinfo)
     diag.event("chromium.spawned", browser_pid=proc.pid, port=port)
     return proc, port
 
@@ -2512,6 +2528,8 @@ class ChromeWorker(QThread):
             diag.event("browser.dom", state=ready)
             self.hwnd_ready.emit(hwnd)
         except Exception as exc:
+            if isinstance(exc, browser_process.ProfileInUseError):
+                self.busy_profile_pids = exc.pids
             self.failure = {"phase": self.phase, "type": type(exc).__name__,
                             "exit_code": self.proc.poll() if self.proc else None,
                             "profile_owner_pids": self.busy_profile_pids}
@@ -3706,9 +3724,17 @@ class MainWindow(QMainWindow):
             return
         failure = getattr(self.worker, "failure", {}) if self.worker else {}
         code = failure.get("exit_code")
-        if code == 0:
+        if failure.get("type") == "ProfileInUseError":
+            message = ("Профиль Chromium занят ещё до запуска. Закройте оставшиеся от предыдущего "
+                       "запуска экземпляры браузера Legalyze и повторите запуск. Процессы не завершались автоматически. PID: " +
+                       ", ".join(map(str, failure.get("profile_owner_pids", []))))
+        elif failure.get("type") == "DesktopLaunchError":
+            message = ("Не удалось запустить Chromium с обычными правами текущего пользователя. "
+                       "Запустите Legalyze без прав администратора. Если запуск идёт из PyCharm, "
+                       "сам PyCharm также должен быть запущен без прав администратора.")
+        elif code == 0:
             message = ("Chromium найден и запущен, но стартовый процесс завершился с кодом 0. "
-                       "Возможна передача запуска уже работающему браузеру с тем же профилем. "
+                       "Возможен перезапуск Chromium с понижением прав или передача запуска уже работающему браузеру с тем же профилем. "
                        "Закройте прежний экземпляр Legalyze/Chromium и повторите запуск. "
                        "Для проверки без изменения старого профиля: LEGALYZE_FRESH_PROFILE=1.")
             if failure.get("profile_owner_pids"):
@@ -3717,7 +3743,7 @@ class MainWindow(QMainWindow):
             message = "Не найден исполняемый файл Chromium. Пути поиска записаны в журнал."
         else:
             message = ("Chromium не готов: этап " + str(failure.get("phase", "unknown")) +
-                       ", код завершения " + str(code) + ". Проверьте chromium-stderr.log и diagnostic.jsonl.")
+                       ", код завершения " + str(code) + ". Проверьте chromium.log и diagnostic.jsonl.")
         diag.event("browser.failed", logs=str(diag.LOG_DIR), **failure)
         self._show_overlay("Браузер не готов", message, error=True)
         QMessageBox.warning(self, "Legalyze — запуск Chromium", message + "\n\nЛоги: " + str(diag.LOG_DIR))
