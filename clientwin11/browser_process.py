@@ -86,9 +86,11 @@ class WindowsAPI:
             function.argtypes, function.restype = args, result
 
     @staticmethod
-    def checked(result):
+    def checked(result, operation="Win32"):
         if not result:
-            raise ctypes.WinError(ctypes.get_last_error())
+            error = ctypes.WinError(ctypes.get_last_error())
+            error.operation = operation
+            raise error
         return result
 
     def close(self, handle):
@@ -99,9 +101,10 @@ class WindowsAPI:
         size = w.DWORD()
         self.advapi.GetTokenInformation(token, kind, None, 0, ctypes.byref(size))
         if not size.value:
-            raise ctypes.WinError(ctypes.get_last_error())
+            self.checked(False, "GetTokenInformation.size." + str(kind))
         buffer = ctypes.create_string_buffer(size.value)
-        self.checked(self.advapi.GetTokenInformation(token, kind, buffer, size, ctypes.byref(size)))
+        self.checked(self.advapi.GetTokenInformation(token, kind, buffer, size, ctypes.byref(size)),
+                     "GetTokenInformation." + str(kind))
         return buffer
 
     @contextmanager
@@ -114,25 +117,48 @@ class WindowsAPI:
             if not hwnd:
                 raise DesktopLaunchError('No interactive desktop shell')
             pid = w.DWORD()
-            self.checked(self.user.GetWindowThreadProcessId(hwnd, ctypes.byref(pid)))
-            shell_process = self.checked(self.kernel.OpenProcess(0x1000, False, pid.value))
-            self.checked(self.advapi.OpenProcessToken(shell_process, 0x000A, ctypes.byref(shell_token)))
+            self.checked(self.user.GetWindowThreadProcessId(hwnd, ctypes.byref(pid)), "GetWindowThreadProcessId")
+            shell_process = self.checked(self.kernel.OpenProcess(0x1000, False, pid.value), "OpenProcess.desktop")
+            self.checked(self.advapi.OpenProcessToken(shell_process, 0x000A, ctypes.byref(shell_token)), "OpenProcessToken.desktop")
             self.checked(self.advapi.OpenProcessToken(self.kernel.GetCurrentProcess(), 0x0008,
-                                                     ctypes.byref(current_token)))
-            shell_user = self.token_info(shell_token, 1)  # TokenUser
-            current_user = self.token_info(current_token, 1)
-            same_user = self.advapi.EqualSid(SID_AND_ATTRIBUTES.from_buffer(shell_user).Sid,
-                                            SID_AND_ATTRIBUTES.from_buffer(current_user).Sid)
-            shell_session = w.DWORD.from_buffer(self.token_info(shell_token, 12)).value
-            current_session = w.DWORD.from_buffer(self.token_info(current_token, 12)).value
-            shell_elevated = w.DWORD.from_buffer(self.token_info(shell_token, 20)).value
-            if not same_user or shell_session != current_session or shell_elevated:
-                raise DesktopLaunchError('Desktop token must be unelevated and belong to the same user/session')
-            # TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY; SecurityImpersonation, TokenPrimary.
-            self.checked(self.advapi.DuplicateTokenEx(shell_token, 0x000B, None, 2, 1, ctypes.byref(primary)))
+                                                     ctypes.byref(current_token)), "OpenProcessToken.current")
+            self.validate_token(shell_token, current_token)
+            # Ask for rights granted by the token DACL, not additional privileges.
+            self.checked(self.advapi.DuplicateTokenEx(shell_token, 0x02000000, None, 2, 1, ctypes.byref(primary)),
+                         "DuplicateTokenEx.desktop")
             yield primary
         finally:
             for handle in (primary, current_token, shell_token, shell_process):
+                self.close(handle)
+
+    def validate_token(self, candidate, current):
+        candidate_user = self.token_info(candidate, 1)
+        current_user = self.token_info(current, 1)
+        same_user = self.advapi.EqualSid(SID_AND_ATTRIBUTES.from_buffer(candidate_user).Sid,
+                                        SID_AND_ATTRIBUTES.from_buffer(current_user).Sid)
+        candidate_session = w.DWORD.from_buffer(self.token_info(candidate, 12)).value
+        current_session = w.DWORD.from_buffer(self.token_info(current, 12)).value
+        elevated = w.DWORD.from_buffer(self.token_info(candidate, 20)).value
+        if not same_user or candidate_session != current_session or elevated:
+            error = DesktopLaunchError('Token must be unelevated and belong to the same user/session')
+            error.operation = 'validate_token'
+            raise error
+
+    @contextmanager
+    def linked_token(self):
+        """Prefer our own UAC-linked limited token; no access to Explorer needed."""
+        current, linked, primary = w.HANDLE(), w.HANDLE(), w.HANDLE()
+        try:
+            self.checked(self.advapi.OpenProcessToken(self.kernel.GetCurrentProcess(), 0x0008,
+                         ctypes.byref(current)), 'OpenProcessToken.current')
+            info = self.token_info(current, 19)  # TOKEN_LINKED_TOKEN owns a HANDLE to close.
+            linked = w.HANDLE(w.HANDLE.from_buffer(info).value)
+            self.validate_token(linked, current)
+            self.checked(self.advapi.DuplicateTokenEx(linked, 0x02000000, None, 2, 1, ctypes.byref(primary)),
+                         'DuplicateTokenEx.linked')
+            yield primary
+        finally:
+            for handle in (primary, linked, current):
                 self.close(handle)
 
     def create(self, token, args):
@@ -145,7 +171,7 @@ class WindowsAPI:
         # No handle inheritance; native Chromium diagnostics still use --log-file.
         self.checked(self.advapi.CreateProcessWithTokenW(
             token, 0, args[0], command, 0x08000000, None, os.getcwd(),
-            ctypes.byref(startup), ctypes.byref(info)))
+            ctypes.byref(startup), ctypes.byref(info)), "CreateProcessWithTokenW")
         self.close(info.hThread)
         return info.hProcess, info.dwProcessId
 
@@ -202,14 +228,25 @@ class OwnedProcess:
             self._api.close(handle)
 
 
-def launch_unelevated(args, api=None):
+def launch_unelevated(args, api=None, report=None):
     api = api if api is not None else WindowsAPI()
-    try:
-        with api.desktop_token() as token:
-            handle, pid = api.create(token, args)
-        return OwnedProcess(api, handle, pid)
-    except (OSError, DesktopLaunchError) as exc:
-        # No elevated fallback: that would reproduce auto-de-elevation and lose ownership.
-        error = DesktopLaunchError('Cannot launch as desktop user; run Legalyze without administrator rights')
-        error.winerror = getattr(exc, 'winerror', None)
-        raise error from exc
+    report = report if report is not None else lambda *args, **kwargs: None
+    attempts = []
+    for source, token_factory in (("linked", api.linked_token), ("desktop", api.desktop_token)):
+        try:
+            with token_factory() as token:
+                handle, pid = api.create(token, args)
+            process = OwnedProcess(api, handle, pid)
+            process.token_source = source
+            return process
+        except (OSError, DesktopLaunchError) as exc:
+            attempt = {"source": source, "operation": getattr(exc, 'operation', 'token_setup'),
+                       "winerror": getattr(exc, 'winerror', None), "type": type(exc).__name__}
+            attempts.append(attempt)
+            report('chromium.token_attempt_failed', **attempt)
+    # No elevated/no-sandbox fallback and no process adoption by a matching profile.
+    error = DesktopLaunchError('Cannot launch as same user; run Legalyze and its IDE without administrator rights')
+    error.winerror = attempts[-1]['winerror']
+    error.operation = attempts[-1]['operation']
+    error.attempts = attempts
+    raise error

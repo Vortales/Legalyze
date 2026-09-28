@@ -674,9 +674,9 @@ def launch_chrome():
         startupinfo.wShowWindow = 4  # SW_SHOWNOACTIVATE, not SW_HIDE: keep _1 discoverable.
     diag.event("chromium.launch", executable=browser_path, args=args, profile=str(profile), port=port)
     if policy["desktop_token"]:
-        proc = browser_process.launch_unelevated(args)
+        proc = browser_process.launch_unelevated(args, report=diag.event)
         diag.event("chromium.desktop_token_launch", browser_pid=proc.pid,
-                   same_user=True, same_session=True, elevated=False,
+                   same_user=True, same_session=True, elevated=False, token_source=proc.token_source,
                    stdio_captured=False, native_log=str(diag.LOG_DIR / "chromium.log"))
     else:
         with open(diag.LOG_DIR / "chromium-stdout.log", "ab") as stdout, open(diag.LOG_DIR / "chromium-stderr.log", "ab") as stderr:
@@ -2532,7 +2532,9 @@ class ChromeWorker(QThread):
                 self.busy_profile_pids = exc.pids
             self.failure = {"phase": self.phase, "type": type(exc).__name__,
                             "exit_code": self.proc.poll() if self.proc else None,
-                            "profile_owner_pids": self.busy_profile_pids}
+                            "profile_owner_pids": self.busy_profile_pids,
+                            "winerror": getattr(exc, "winerror", None),
+                            "operation": getattr(exc, "operation", None)}
             diag.event("chromium.failure", **self.failure)
             diag.exception("ChromeWorker.run")
             self.failed.emit()
@@ -3731,7 +3733,9 @@ class MainWindow(QMainWindow):
         elif failure.get("type") == "DesktopLaunchError":
             message = ("Не удалось запустить Chromium с обычными правами текущего пользователя. "
                        "Запустите Legalyze без прав администратора. Если запуск идёт из PyCharm, "
-                       "сам PyCharm также должен быть запущен без прав администратора.")
+                       "сам PyCharm также должен быть запущен без прав администратора. "
+                       "Windows API: " + str(failure.get("operation")) +
+                       ", код: " + str(failure.get("winerror")) + ".")
         elif code == 0:
             message = ("Chromium найден и запущен, но стартовый процесс завершился с кодом 0. "
                        "Возможен перезапуск Chromium с понижением прав или передача запуска уже работающему браузеру с тем же профилем. "

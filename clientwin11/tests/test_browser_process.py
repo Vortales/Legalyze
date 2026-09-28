@@ -29,7 +29,7 @@ class LaunchPolicyTests(unittest.TestCase):
         tree = ast.parse((ROOT/'main.py').read_text())
         fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'launch_chrome')
         fn.decorator_list = []
-        process = SimpleNamespace(pid=123)
+        process = SimpleNamespace(pid=123, token_source='linked')
         browser = SimpleNamespace(launch_policy=Mock(return_value={'desktop_token': desktop_token}),
                                   launch_unelevated=Mock(return_value=process), ProfileInUseError=bp.ProfileInUseError)
         sub = SimpleNamespace(Popen=Mock(return_value=process), STARTUPINFO=SimpleNamespace,
@@ -125,6 +125,7 @@ class OwnedProcessTests(unittest.TestCase):
                     finally:
                         released()
                 api = Mock()
+                api.linked_token = token
                 api.desktop_token = token
                 api.create.return_value = (123, 42)
                 if fails:
@@ -134,8 +135,9 @@ class OwnedProcessTests(unittest.TestCase):
                 else:
                     process = bp.launch_unelevated(['chrome.exe'], api)
                     self.assertEqual(process.pid, 42)
-                released.assert_called_once()
-                api.create.assert_called_once_with(99, ['chrome.exe'])
+                self.assertEqual(released.call_count, 2 if fails else 1)
+                self.assertEqual(api.create.call_count, 2 if fails else 1)
+                api.create.assert_called_with(99, ['chrome.exe'])
 
     def test_rejected_token_never_creates_process(self):
         @contextmanager
@@ -143,6 +145,7 @@ class OwnedProcessTests(unittest.TestCase):
             raise bp.DesktopLaunchError('Different desktop user')
             yield
         api = Mock()
+        api.linked_token = rejected
         api.desktop_token = rejected
         with self.assertRaises(bp.DesktopLaunchError):
             bp.launch_unelevated(['chrome.exe'], api)
@@ -156,7 +159,7 @@ class DesktopTokenValidationTests(unittest.TestCase):
                 api = bp.WindowsAPI.__new__(bp.WindowsAPI)
                 closed = []
                 api.close = lambda h: closed.append(getattr(h, 'value', h)) if h else None
-                api.checked = lambda value: value
+                api.checked = lambda value, *args: value
                 def set_pid(hwnd, pointer):
                     ctypes.cast(pointer, ctypes.POINTER(bp.w.DWORD))[0] = 100
                     return 10
@@ -164,7 +167,7 @@ class DesktopTokenValidationTests(unittest.TestCase):
                     ctypes.cast(pointer, ctypes.POINTER(bp.w.HANDLE))[0] = 22 if process == 11 else 33
                     return True
                 def duplicate(token, access, security, level, kind, pointer):
-                    self.assertEqual(access, 0x000B)
+                    self.assertEqual(access, 0x02000000)
                     self.assertEqual((level, kind), (2, 1))
                     ctypes.cast(pointer, ctypes.POINTER(bp.w.HANDLE))[0] = 44
                     return True
@@ -193,7 +196,7 @@ class DesktopTokenValidationTests(unittest.TestCase):
     def test_create_uses_offscreen_args_no_activation_and_closes_thread_handle(self):
         import ctypes
         api = bp.WindowsAPI.__new__(bp.WindowsAPI)
-        api.checked = lambda value: value
+        api.checked = lambda value, *args: value
         api.close = Mock()
         args = ['C:/Program Files/Chromium/chrome.exe', '--user-data-dir=C:/Users/Test/Profile',
                 '--window-position=-8192,-8192']
@@ -211,6 +214,75 @@ class DesktopTokenValidationTests(unittest.TestCase):
         api.advapi = SimpleNamespace(CreateProcessWithTokenW=create)
         self.assertEqual(api.create(44, args), (123, 789))
         api.close.assert_called_once_with(456)
+
+
+class LinkedTokenRegressionTests(unittest.TestCase):
+    def test_linked_success_does_not_open_desktop(self):
+        @contextmanager
+        def linked():
+            yield 7
+        api = Mock()
+        api.linked_token = linked
+        api.create.return_value = (123, 42)
+        process = bp.launch_unelevated(['chrome.exe'], api)
+        self.assertEqual(process.token_source, 'linked')
+        api.desktop_token.assert_not_called()
+
+    def test_fallback_reports_only_operation_and_error_code(self):
+        @contextmanager
+        def denied():
+            error = OSError('secret path and account must not appear in log')
+            error.winerror = 5
+            error.operation = 'GetTokenInformation.19'
+            raise error
+            yield
+        @contextmanager
+        def desktop():
+            yield 8
+        api = Mock()
+        api.linked_token, api.desktop_token = denied, desktop
+        api.create.return_value = (123, 42)
+        report = Mock()
+        process = bp.launch_unelevated(['chrome.exe'], api, report)
+        self.assertEqual(process.token_source, 'desktop')
+        report.assert_called_once_with('chromium.token_attempt_failed', source='linked',
+                                      operation='GetTokenInformation.19', winerror=5, type='OSError')
+        api.create.assert_called_once_with(8, ['chrome.exe'])
+
+    def test_linked_token_is_validated_duplicated_and_all_handles_closed(self):
+        import ctypes
+        for valid in (True, False):
+            with self.subTest(valid=valid):
+                api = bp.WindowsAPI.__new__(bp.WindowsAPI)
+                api.checked = lambda result, *args: result
+                closed = []
+                api.close = lambda h: closed.append(h.value) if h else None
+                def opened(process, access, pointer):
+                    ctypes.cast(pointer, ctypes.POINTER(bp.w.HANDLE))[0] = 11
+                    return True
+                def duplicate(token, access, security, level, kind, pointer):
+                    self.assertEqual(token.value, 22)
+                    self.assertEqual(access, 0x02000000)
+                    ctypes.cast(pointer, ctypes.POINTER(bp.w.HANDLE))[0] = 33
+                    return True
+                value = bp.w.HANDLE(22)
+                buffer = ctypes.create_string_buffer(ctypes.string_at(ctypes.byref(value), ctypes.sizeof(value)))
+                api.kernel = SimpleNamespace(GetCurrentProcess=lambda: -1)
+                api.advapi = SimpleNamespace(OpenProcessToken=opened, DuplicateTokenEx=Mock(side_effect=duplicate))
+                api.token_info = Mock(return_value=buffer)
+                api.validate_token = Mock(side_effect=None if valid else bp.DesktopLaunchError('invalid token'))
+                if valid:
+                    with api.linked_token() as token:
+                        self.assertEqual(token.value, 33)
+                    self.assertCountEqual(closed, [11, 22, 33])
+                else:
+                    with self.assertRaises(bp.DesktopLaunchError):
+                        with api.linked_token():
+                            self.fail('Invalid token yielded')
+                    api.advapi.DuplicateTokenEx.assert_not_called()
+                    self.assertCountEqual(closed, [11, 22])
+                api.validate_token.assert_called_once()
+                self.assertEqual(api.token_info.call_args.args[1], 19)
 
 
 if __name__ == '__main__':
