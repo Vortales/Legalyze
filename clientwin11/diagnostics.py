@@ -18,6 +18,7 @@ import threading
 import time
 import traceback
 import uuid
+from storage_paths import app_dir
 
 LOG_DIR = None
 FAULT_FILE = None
@@ -81,8 +82,7 @@ def setup():
     if _started:
         return
     session = time.strftime('%Y%m%d-%H%M%S') + f'-{os.getpid()}-{uuid.uuid4().hex[:6]}'
-    for base in (Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'LegalyzeWin11' / 'logs',
-                 Path(tempfile.gettempdir()) / 'LegalyzeWin11' / 'logs'):
+    for base in (app_dir() / 'logs',):
         try:
             directory = base / session
             directory.mkdir(parents=True, exist_ok=False)

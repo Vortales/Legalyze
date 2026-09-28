@@ -50,9 +50,9 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertNotIn('--window-position=-32000', source)
         self.assertNotIn('startupinfo.wShowWindow = 0', source)
 
-    def test_profile_and_config_are_isolated(self):
+    def test_profile_and_config_use_canonical_root(self):
         import config
-        self.assertIn('LegalyzeWin11', str(config.APP_DIR))
+        self.assertEqual(config.APP_DIR.name, 'Legalyze')
         self.assertFalse((ROOT / 'config.json').exists())
 
     def test_setparent_null_success_is_not_failure(self):
@@ -229,6 +229,101 @@ class FocusAndStartupTests(unittest.TestCase):
         with patch.object(browser_focus, 'handoff') as focus:
             bridge.poll(100, 200, False)
         focus.assert_not_called()
+
+
+class StorageMigrationTests(unittest.TestCase):
+    def test_process_probe_handles_powershell_singleton_output(self):
+        import storage_paths as storage
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        result = SimpleNamespace(returncode=0, stdout=json.dumps({
+            'ProcessId': 42, 'CommandLine': 'chrome.exe --user-data-dir=C:/Users/Test/Legalyze/chromium-profile'
+        }).encode())
+        with patch.object(storage.os, 'name', 'nt'), patch.object(storage.subprocess, 'run', return_value=result):
+            self.assertEqual(storage.busy_windows_paths(['C:/Users/Test/Legalyze/chromium-profile']), [42])
+            self.assertEqual(storage.busy_windows_paths(['C:/Users/Other/Profile']), [])
+
+    def test_migrates_data_and_logs_without_losing_conflicts(self):
+        import storage_paths as storage
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root, roaming, local = base/'Legalyze', base/'Roaming'/'LegalyzeWin11', base/'Local'/'LegalyzeWin11'
+            root.mkdir()
+            (root/'config.json').write_text('canonical')
+            roaming.mkdir(parents=True)
+            (roaming/'config.json').write_text('diagnostic')
+            (roaming/'Шаблон.txt').write_text('template')
+            (roaming/'data').mkdir()
+            (roaming/'data'/'cache').write_bytes(b'encrypted')
+            (local/'Profile').mkdir(parents=True)
+            (local/'Profile'/'Preferences').write_text('preferences')
+            (local/'logs'/'session').mkdir(parents=True)
+            (local/'logs'/'session'/'diagnostic.jsonl').write_text('history')
+            sources = [('roaming', roaming), ('local', local)]
+            storage.migrate_legacy(root, sources, busy_check=lambda paths: [])
+            self.assertFalse(roaming.exists())
+            self.assertFalse(local.exists())
+            self.assertEqual((root/'config.json').read_text(), 'canonical')
+            self.assertEqual((root/'Шаблон.txt').read_text(), 'template')
+            self.assertEqual((root/'data'/'cache').read_bytes(), b'encrypted')
+            self.assertEqual((root/'chromium-profile'/'Preferences').read_text(), 'preferences')
+            self.assertEqual(next((root/'migration-backups').glob('roaming-*/config.json')).read_text(), 'diagnostic')
+            self.assertEqual(next((root/'logs').glob('imported-*/session/diagnostic.jsonl')).read_text(), 'history')
+            # Second startup does no slow process scan and never overwrites files.
+            from unittest.mock import Mock
+            check = Mock(side_effect=AssertionError('should not scan again'))
+            self.assertEqual(storage.migrate_legacy(root, sources, busy_check=check), [])
+
+    def test_busy_profile_prevents_migration(self):
+        import storage_paths as storage
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            old = base/'old'
+            old.mkdir()
+            (old/'config.json').write_text('keep')
+            with self.assertRaises(RuntimeError):
+                storage.migrate_legacy(base/'Legalyze', [('roaming', old)], busy_check=lambda paths: [123])
+            self.assertEqual((old/'config.json').read_text(), 'keep')
+
+    def test_incomplete_archive_resumes_after_interrupted_copy(self):
+        import storage_paths as storage
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)/'Legalyze'
+            archive = root/'migration-backups'/'roaming-LegalyzeWin11-123'
+            archive.mkdir(parents=True)
+            (archive/'config.json').write_text('config')
+            storage.migrate_legacy(root, [], busy_check=lambda paths: [])
+            self.assertEqual((root/'config.json').read_text(), 'config')
+            self.assertTrue((archive/'.migration-complete').exists())
+
+    def test_existing_profile_is_not_merged(self):
+        import storage_paths as storage
+        with tempfile.TemporaryDirectory() as tmp:
+            root, old = Path(tmp)/'Legalyze', Path(tmp)/'old'
+            (root/'chromium-profile').mkdir(parents=True)
+            (root/'chromium-profile'/'Preferences').write_text('current')
+            (old/'Profile').mkdir(parents=True)
+            (old/'Profile'/'Preferences').write_text('old')
+            storage.migrate_legacy(root, [('local', old)], busy_check=lambda paths: [])
+            self.assertEqual((root/'chromium-profile'/'Preferences').read_text(), 'current')
+            self.assertEqual(next((root/'migration-backups').glob('local-*/Profile/Preferences')).read_text(), 'old')
+
+    def test_code_zero_error_is_not_reported_as_missing_folder(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        tree = ast.parse((ROOT/'main.py').read_text())
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'MainWindow')
+        node = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == '_on_failed')
+        node.decorator_list = []
+        messages = Mock()
+        namespace = {'diag': diag, 'QMessageBox': messages}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), 'failure-handler', 'exec'), namespace)
+        window = SimpleNamespace(_closing=False, worker=SimpleNamespace(failure={'exit_code': 0, 'phase': 'window'}),
+                                 _show_overlay=Mock())
+        namespace['_on_failed'](window)
+        message = messages.warning.call_args.args[2]
+        self.assertIn('кодом 0', message)
+        self.assertNotIn('Проверьте папку', message)
 
 
 class CDPTests(unittest.TestCase):

@@ -43,18 +43,8 @@ def _bundle_dir() -> Path:
 
 
 def _writable_app_dir() -> Path:
-    """
-    Директория для пользовательских данных приложения.
-    Всегда возвращает путь в %APPDATA%/Legalyze, независимо от способа запуска.
-    """
-    if os.name == "nt":
-        appdata = os.environ.get("APPDATA")
-        if appdata:
-            return Path(appdata) / "LegalyzeWin11"
-        return Path.home() / "AppData" / "Roaming" / "LegalyzeWin11"
-
-    # На всякий случай для macOS / Linux систем
-    return Path.home() / ".local" / "share" / "LegalyzeWin11"
+    from storage_paths import app_dir
+    return app_dir()
 
 
 def _legacy_local_dir():

@@ -7,6 +7,7 @@ diag.setup()
 from diagnostics import stage
 import win32_diagnostics as native_diag
 import browser_focus
+import storage_paths
 
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -70,7 +71,7 @@ except Exception:
 diag.install_http()
 
 URL = "https://google.com/ai"
-PROFILE = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "LegalyzeWin11" / ("Profile-" + diag.LOG_DIR.name if os.environ.get("LEGALYZE_FRESH_PROFILE") == "1" else "Profile")
+PROFILE = APP_DIR / ("chromium-profile-" + diag.LOG_DIR.name if os.environ.get("LEGALYZE_FRESH_PROFILE") == "1" else "chromium-profile")
 
 
 def _exe_dir() -> Path:
@@ -132,9 +133,12 @@ def resolve_browser_path() -> str:
             d / "chromium.exe",
         ])
 
-    for c in candidates:
+    for c in dict.fromkeys(candidates):
         try:
-            if c.is_file():
+            found = c.is_file()
+            diag.event("browser.path_candidate", path=str(c), exists=found)
+            if found:
+                diag.event("browser.path_selected", path=str(c))
                 return str(c)
         except Exception:
             diag.exception("main.py:139")
@@ -608,9 +612,10 @@ def _set_browser_zoom_preferences(profile_dir: Path):
 
 @stage
 def launch_chrome():
+    profile = PROFILE
     port = _free_port()
-    PROFILE.mkdir(parents=True, exist_ok=True)
-    _set_browser_zoom_preferences(PROFILE)
+    profile.mkdir(parents=True, exist_ok=True)
+    _set_browser_zoom_preferences(profile)
 
     browser_path = resolve_browser_path()
     if not browser_path:
@@ -625,7 +630,7 @@ def launch_chrome():
     args = [
         browser_path,
         f"--remote-debugging-port={port}",
-        f"--user-data-dir={PROFILE}",
+        f"--user-data-dir={profile}",
         f"--app={URL}",
         "--use-fake-ui-for-media-stream",
         "--no-first-run",
@@ -657,7 +662,7 @@ def launch_chrome():
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = 4  # SW_SHOWNOACTIVATE, not SW_HIDE: keep _1 discoverable.
-    diag.event("chromium.launch", executable=browser_path, args=args, profile=str(PROFILE), port=port)
+    diag.event("chromium.launch", executable=browser_path, args=args, profile=str(profile), port=port)
     with open(diag.LOG_DIR / "chromium-stdout.log", "ab") as stdout, open(diag.LOG_DIR / "chromium-stderr.log", "ab") as stderr:
         proc = subprocess.Popen(args, stdout=stdout, stderr=stderr,
                                 creationflags=creationflags, startupinfo=startupinfo)
@@ -2449,11 +2454,15 @@ class ChromeWorker(QThread):
         self.proc = None
         self.browser = None
         self.page = None
+        self.phase = "launch"
+        self.failure = {}
+        self.busy_profile_pids = []
 
     @stage
     def run(self):
         try:
             self.proc, port = launch_chrome()
+            self.phase = "window"
             deadline = time.monotonic() + 25
             hwnd = None
             previous_hwnd, stable_samples = None, 0
@@ -2462,7 +2471,14 @@ class ChromeWorker(QThread):
                     return
                 code = self.proc.poll()
                 if code is not None:
-                    diag.event("chromium.early_exit", code=code)
+                    diag.event("chromium.early_exit", code=code, profile=str(PROFILE),
+                               possible_handoff=(code == 0))
+                    if code == 0:
+                        try:
+                            self.busy_profile_pids = storage_paths.busy_windows_paths([PROFILE])
+                            diag.event("chromium.profile_owners", pids=self.busy_profile_pids)
+                        except Exception:
+                            diag.exception("chromium.profile_owners")
                     raise RuntimeError("Chromium exited before window discovery")
                 hwnd = find_chrome_hwnd(get_child_pids(self.proc.pid))
                 if hwnd and hwnd == previous_hwnd:
@@ -2478,7 +2494,9 @@ class ChromeWorker(QThread):
                 raise TimeoutError("No owned Chromium window within 25 seconds")
             self.window_found.emit(hwnd)
             # Browser visibility is no longer gated by network/DOM/CDP readiness.
+            self.phase = "cdp"
             self.browser, self.page = attach_chrome(port)
+            self.phase = "page"
             grant_mic_permission(self.browser, self.page)
             install_purge(self.page)
             deadline = time.monotonic() + 15
@@ -2493,7 +2511,11 @@ class ChromeWorker(QThread):
                 time.sleep(0.2)
             diag.event("browser.dom", state=ready)
             self.hwnd_ready.emit(hwnd)
-        except Exception:
+        except Exception as exc:
+            self.failure = {"phase": self.phase, "type": type(exc).__name__,
+                            "exit_code": self.proc.poll() if self.proc else None,
+                            "profile_owner_pids": self.busy_profile_pids}
+            diag.event("chromium.failure", **self.failure)
             diag.exception("ChromeWorker.run")
             self.failed.emit()
 
@@ -3680,17 +3702,25 @@ class MainWindow(QMainWindow):
     @pyqtSlot()  # Explicit zero-argument Qt slot: clicked(bool) must not reach @stage.
     @stage
     def _on_failed(self):
-        diag.event("browser.failed", logs=str(diag.LOG_DIR))
-        QMessageBox.warning(self, "Ошибка запуска браузера", "Главное окно продолжает работать. Подробности:\n" + str(diag.LOG_DIR))
         if self._closing:
             return
-
-        QMessageBox.critical(
-            self,
-            "Ошибка",
-            "Не удалось запустить браузер.\nПроверьте папку «chromium» рядом с программой."
-        )
-        self._close_app()
+        failure = getattr(self.worker, "failure", {}) if self.worker else {}
+        code = failure.get("exit_code")
+        if code == 0:
+            message = ("Chromium найден и запущен, но стартовый процесс завершился с кодом 0. "
+                       "Возможна передача запуска уже работающему браузеру с тем же профилем. "
+                       "Закройте прежний экземпляр Legalyze/Chromium и повторите запуск. "
+                       "Для проверки без изменения старого профиля: LEGALYZE_FRESH_PROFILE=1.")
+            if failure.get("profile_owner_pids"):
+                message += " PID процессов с этим профилем: " + ", ".join(map(str, failure["profile_owner_pids"]))
+        elif failure.get("type") == "FileNotFoundError" and not self.worker.proc:
+            message = "Не найден исполняемый файл Chromium. Пути поиска записаны в журнал."
+        else:
+            message = ("Chromium не готов: этап " + str(failure.get("phase", "unknown")) +
+                       ", код завершения " + str(code) + ". Проверьте chromium-stderr.log и diagnostic.jsonl.")
+        diag.event("browser.failed", logs=str(diag.LOG_DIR), **failure)
+        self._show_overlay("Браузер не готов", message, error=True)
+        QMessageBox.warning(self, "Legalyze — запуск Chromium", message + "\n\nЛоги: " + str(diag.LOG_DIR))
 
     @stage
     def _cleanup(self):
@@ -3855,6 +3885,33 @@ def main():
         if user32:
             user32.MessageBoxW(None, "Диагностический клиент уже запущен.", "Legalyze", 0x30)
         return
+    legacy_locks = []
+    try:
+        locked_roots = set()
+        for label, old_root in storage_paths.legacy_roots():
+            if old_root.exists() and old_root not in locked_roots:
+                locked_roots.add(old_root)
+                old_lock = QLockFile(str(old_root / "diagnostic-client.lock"))
+                old_lock.setStaleLockTime(0)
+                if not old_lock.tryLock(100):
+                    raise RuntimeError("Old diagnostic client is still running")
+                legacy_locks.append(old_lock)
+        # Release lock file handles before directory rename (mandatory on Windows).
+        # The old clients must be closed; browser-process preflight runs in migrator.
+        for old_lock in legacy_locks:
+            old_lock.unlock()
+        for migration in storage_paths.migrate_legacy(APP_DIR, storage_paths.legacy_roots()):
+            diag.event("storage.migrated", **migration)
+    except Exception:
+        diag.exception("storage.migration")
+        if user32:
+            user32.MessageBoxW(None,
+                "Не удалось безопасно перенести старые данные. Закройте старые версии Legalyze и их Chromium, затем повторите запуск. "
+                "Данные не удалялись принудительно. Логи: " + str(diag.LOG_DIR), "Legalyze — перенос данных", 0x30)
+        return
+    finally:
+        for old_lock in legacy_locks:
+            old_lock.unlock()
     diag.event("storage.paths", app_dir=str(APP_DIR), data_dir=str(DATA_DIR), profile=str(PROFILE), logs=str(diag.LOG_DIR))
     cfg = load_config()
     cfg = _migrate_config_secrets(cfg)
