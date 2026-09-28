@@ -35,7 +35,7 @@ from PyQt6.QtWidgets import (
     QFormLayout, QMessageBox, QInputDialog, QGraphicsDropShadowEffect,
     QSizePolicy,
 )
-from PyQt6.QtCore import QTimer, QThread, pyqtSignal, Qt, QPoint, QRectF, QLockFile
+from PyQt6.QtCore import QTimer, QThread, pyqtSignal, Qt, QPoint, QRectF, QLockFile, pyqtSlot
 from PyQt6.QtGui import (
     QFont, QPainter, QColor, QPen, QBrush, QPainterPath, QKeySequence,
 )
@@ -1781,6 +1781,7 @@ class LoginWindow(QDialog):
             return
         super().keyPressEvent(event)
 
+    @pyqtSlot()  # Explicit zero-argument Qt slot: clicked(bool) must not reach @stage.
     @stage
     def _do_login(self):
         if self._is_logging_in:
@@ -3117,6 +3118,7 @@ class MainWindow(QMainWindow):
             diag.exception("main.py:3117")
             return False, 0
 
+    @pyqtSlot()  # Explicit zero-argument Qt slot: clicked(bool) must not reach @stage.
     @stage
     def _toggle_visibility(self):
         if self.isVisible():
@@ -3225,6 +3227,7 @@ class MainWindow(QMainWindow):
             save_template(self.cfg, dlg.get_template())
             self._reload_prompt()
 
+    @pyqtSlot()  # Explicit zero-argument Qt slot: clicked(bool) must not reach @stage.
     @stage
     def _sync_template_from_server(self):
         if not self.token:
@@ -3321,6 +3324,7 @@ class MainWindow(QMainWindow):
         self._page_eval_async(JS_REMOVE_ALL_FILES, 3)
         QTimer.singleShot(650, lambda: self._load_prompt(force=True))
 
+    @pyqtSlot()  # Explicit zero-argument Qt slot: clicked(bool) must not reach @stage.
     @stage
     def _start_chrome(self):
         if self.worker is not None:
@@ -3532,6 +3536,7 @@ class MainWindow(QMainWindow):
                 )
                 self._close_app()
 
+    @pyqtSlot()  # Explicit zero-argument Qt slot: clicked(bool) must not reach @stage.
     @stage
     def _on_failed(self):
         diag.event("browser.failed", logs=str(diag.LOG_DIR))
@@ -3630,6 +3635,7 @@ class MainWindow(QMainWindow):
             diag.exception("main.py:3630")
             pass
 
+    @pyqtSlot()  # Explicit zero-argument Qt slot: clicked(bool) must not reach @stage.
     @stage
     def _close_app(self):
         if self._closing:
@@ -3647,6 +3653,7 @@ class MainWindow(QMainWindow):
         diag.event("session.forced_exit", reason="close or restart")
         os._exit(0)
 
+    @pyqtSlot()  # Explicit zero-argument Qt slot: clicked(bool) must not reach @stage.
     @stage
     def _restart(self):
         if self._closing:

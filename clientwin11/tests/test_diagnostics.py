@@ -126,6 +126,66 @@ class CDPTests(unittest.TestCase):
             cdp._lock.release()
 
 
+class QtSlotRegressionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
+        cls.QObject, cls.pyqtSignal, cls.pyqtSlot = QObject, pyqtSignal, pyqtSlot
+
+    def test_original_variadic_wrapper_receives_unwanted_checked_argument(self):
+        QObject, pyqtSignal = self.QObject, self.pyqtSignal
+        class Emitter(QObject):
+            clicked = pyqtSignal(bool)
+        class Receiver(QObject):
+            @diag.stage
+            def handle(self):
+                raise AssertionError('Body must not be reached in this reproduction')
+        sender, receiver = Emitter(), Receiver()
+        errors = []
+        sender.clicked.connect(receiver.handle)
+        with patch.object(sys, 'excepthook', side_effect=lambda *info: errors.append(info)), \
+             patch.object(diag, 'event') as log:
+            sender.clicked.emit(False)
+        self.assertEqual(len(errors), 1)
+        self.assertIs(errors[0][0], TypeError)
+        self.assertTrue(any(c.args[0] == 'call.signature_mismatch' for c in log.call_args_list))
+
+    def test_actual_zero_argument_slot_declarations_discard_clicked_bool(self):
+        # Extract the production declarations/decorators, stub only their side effects.
+        # QtCore is enough: no display, OpenGL, auth server, Chromium or os._exit.
+        import copy
+        QObject, pyqtSignal = self.QObject, self.pyqtSignal
+        class Emitter(QObject):
+            clicked = pyqtSignal(bool)
+        expected = {'_do_login', '_close_app', '_restart', '_toggle_visibility',
+                    '_start_chrome', '_sync_template_from_server', '_on_failed'}
+        tree = ast.parse((ROOT / 'main.py').read_text())
+        methods = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name in expected:
+                node = copy.deepcopy(node)
+                node.body = ast.parse('self.calls += 1').body
+                methods.append(node)
+        self.assertEqual({node.name for node in methods}, expected)
+        cls_node = ast.ClassDef(name='Receiver', bases=[ast.Name(id='QObject', ctx=ast.Load())],
+                                keywords=[], body=methods, decorator_list=[])
+        namespace = {'QObject': QObject, 'pyqtSlot': self.pyqtSlot, 'stage': diag.stage}
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[cls_node], type_ignores=[])),
+                     'production-slot-declarations', 'exec'), namespace)
+        for method in expected:
+            with self.subTest(method=method):
+                sender, receiver = Emitter(), namespace['Receiver']()
+                receiver.calls = 0
+                errors = []
+                sender.clicked.connect(getattr(receiver, method))
+                with patch.object(sys, 'excepthook', side_effect=lambda *info: errors.append(info)):
+                    sender.clicked.emit(False)
+                    sender.clicked.emit(True)
+                    getattr(receiver, method)()  # Enter / direct Python invocation
+                self.assertEqual(errors, [])
+                self.assertEqual(receiver.calls, 3)
+
+
 class QtTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

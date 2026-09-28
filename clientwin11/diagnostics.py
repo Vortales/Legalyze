@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import faulthandler
 import functools
 import importlib.metadata
+import inspect
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -47,12 +48,26 @@ def exception(where, info=None):
 
 
 def stage(fn):
+    signature = inspect.signature(fn)
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
         start = time.monotonic()
         event('stage.begin', name=fn.__qualname__)
         try:
             result = fn(*args, **kwargs)
+        except SystemExit as exc:
+            event('stage.exit', name=fn.__qualname__, code=exc.code if isinstance(exc.code, int) else None)
+            raise
+        except TypeError:
+            # Diagnose argument binding without exposing argument values or exception text.
+            try:
+                signature.bind(*args, **kwargs)
+            except TypeError:
+                event('call.signature_mismatch', name=fn.__qualname__,
+                      positional_count=len(args), keyword_count=len(kwargs),
+                      parameter_count=len(signature.parameters))
+            exception(fn.__qualname__)
+            raise
         except BaseException:
             exception(fn.__qualname__)
             raise
@@ -181,6 +196,7 @@ def collect_system():
     import subprocess
     command = (
         '$ErrorActionPreference="Stop"; '
+        '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); '
         '@{GPU=@(Get-CimInstance Win32_VideoController | '
         'Select-Object Name,DriverVersion,Status,AdapterRAM); '
         'OS=(Get-CimInstance Win32_OperatingSystem | '
