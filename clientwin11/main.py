@@ -650,7 +650,7 @@ def launch_chrome():
     with open(diag.LOG_DIR / "chromium-stdout.log", "ab") as stdout, open(diag.LOG_DIR / "chromium-stderr.log", "ab") as stderr:
         proc = subprocess.Popen(args, stdout=stdout, stderr=stderr,
                                 creationflags=creationflags, startupinfo=startupinfo)
-    diag.event("chromium.spawned", pid=proc.pid, port=port)
+    diag.event("chromium.spawned", browser_pid=proc.pid, port=port)
     return proc, port
 
 
@@ -1125,9 +1125,39 @@ def install_purge(page: CDP):
             pass
 
 
+def log_page_probe(page):
+    # Deliberately no URL, query, title, text, filenames or HTML in this result.
+    script = """(() => {
+        const h = location.hostname;
+        const category = h === 'accounts.google.com' ? 'google_login' :
+            h === 'consent.google.com' ? 'google_consent' :
+            ['google.com', 'www.google.com', 'gemini.google.com'].includes(h) ? 'google' :
+            location.protocol === 'chrome-error:' ? 'browser_error' :
+            location.href === 'about:blank' ? 'blank' : 'other';
+        return {category, ready: document.readyState,
+            bodyChildren: document.body ? document.body.children.length : 0,
+            fileInputs: document.querySelectorAll('input[type="file"]').length,
+            editors: document.querySelectorAll('textarea,[contenteditable="true"],[role="textbox"]').length,
+            frames: document.querySelectorAll('iframe').length};
+    })()"""
+    try:
+        raw = page.eval(script, timeout=2).get("value")
+        if isinstance(raw, dict):
+            # Treat page-provided data as untrusted: permit only fixed enums and counts.
+            category = raw.get("category")
+            ready = raw.get("ready")
+            counts = {key: raw[key] for key in ("bodyChildren", "fileInputs", "editors", "frames")
+                      if type(raw.get(key)) is int and 0 <= raw[key] <= 1000000}
+            diag.event("page.probe", category=category if category in
+                       ("google_login", "google_consent", "google", "browser_error", "blank", "other") else "unknown",
+                       ready=ready if ready in ("loading", "interactive", "complete") else "unknown", **counts)
+    except Exception:
+        diag.exception("page.probe")
+
+
 def check_state(page: CDP):
     """Состояние чата: present — число готовых файлов, names — их имена."""
-    default = {"present": 0, "uploading": False, "names": []}
+    default = {"present": 0, "uploading": False, "names": [], "probe_ok": False}
 
     try:
         r = page.eval(JS_CHECK_FILES, timeout=2)
@@ -1140,6 +1170,7 @@ def check_state(page: CDP):
                 present = 1 if value.get("present") else 0
             names = value.get("names", []) or []
             return {
+                "probe_ok": True,
                 "present": present,
                 "uploading": bool(value.get("uploading", False)),
                 "names": [str(n) for n in names] if isinstance(names, list) else [],
@@ -2407,6 +2438,7 @@ class ChromeWorker(QThread):
             self.proc, port = launch_chrome()
             deadline = time.monotonic() + 25
             hwnd = None
+            previous_hwnd, stable_samples = None, 0
             while time.monotonic() < deadline:
                 if self.isInterruptionRequested():
                     return
@@ -2415,8 +2447,14 @@ class ChromeWorker(QThread):
                     diag.event("chromium.early_exit", code=code)
                     raise RuntimeError("Chromium exited before window discovery")
                 hwnd = find_chrome_hwnd(get_child_pids(self.proc.pid))
-                if hwnd:
+                if hwnd and hwnd == previous_hwnd:
+                    stable_samples += 1
+                else:
+                    previous_hwnd, stable_samples = hwnd, 1 if hwnd else 0
+                if stable_samples >= 3:
+                    diag.event("win32.window_selected", hwnd=hwnd, stable_samples=stable_samples)
                     break
+                hwnd = None
                 time.sleep(0.2)
             if not hwnd:
                 raise TimeoutError("No owned Chromium window within 25 seconds")
@@ -2447,6 +2485,7 @@ class UploadThread(QThread):
 
     decrement_signal = pyqtSignal()
     attached = pyqtSignal(bool)
+    failed = pyqtSignal(str)
 
     @stage
     def __init__(self, page, pdf_path, template_path, token):
@@ -2460,6 +2499,8 @@ class UploadThread(QThread):
         self.last_upload = 0
         self.files_loaded = False
         self._dedup_done = False
+        self.wait_started = time.monotonic()
+        self._next_diagnostic = 0.0
         self.fails = 0
         self.end_check_counter = 0
 
@@ -2491,6 +2532,9 @@ class UploadThread(QThread):
     def run(self):
         while not self._stop:
             try:
+                if self.wait_started is not None and time.monotonic() - self.wait_started >= 90:
+                    self.failed.emit("attachment_deadline")
+                    return
                 pdf_ok = bool(self.pdf_path) and Path(self.pdf_path).exists()
                 tpl_ok = bool(self.template_path) and Path(self.template_path).exists()
                 if not self.page or not pdf_ok or not tpl_ok:
@@ -2499,6 +2543,12 @@ class UploadThread(QThread):
                     continue
 
                 state = check_state(self.page)
+                if time.monotonic() >= self._next_diagnostic:
+                    self._next_diagnostic = time.monotonic() + 5
+                    diag.event("upload.state", present=state.get("present"), uploading=state.get("uploading"),
+                               probe_ok=state.get("probe_ok", False), pdf_exists=pdf_ok, template_exists=tpl_ok,
+                               attempts_failed=self.fails)
+                    log_page_probe(self.page)
 
                 if state["uploading"]:
                     time.sleep(0.05)
@@ -2516,6 +2566,7 @@ class UploadThread(QThread):
                     complete = present >= REQUIRED_CHAT_FILES
 
                 if complete:
+                    self.wait_started = None
                     if (
                         names_ok
                         and not self._dedup_done
@@ -2540,6 +2591,8 @@ class UploadThread(QThread):
                     time.sleep(0.15)
                     continue
 
+                if self.wait_started is None:
+                    self.wait_started = time.monotonic()
                 if self.files_loaded:
                     self.files_loaded = False
                     self.last_upload = 0
@@ -2572,7 +2625,11 @@ class UploadThread(QThread):
 
                     ok = True
                     for path in to_upload:
-                        if not upload_file_advanced(self.page, path):
+                        if self._stop:
+                            return
+                        injected = upload_file_advanced(self.page, path)
+                        diag.event("upload.attempt", kind="pdf" if path == self.pdf_path else "template", injected=bool(injected))
+                        if not injected:
                             ok = False
                             break
                         time.sleep(0.3)
@@ -2664,6 +2721,7 @@ class PromptSelectionWindow(QDialog):
 
 class MainWindow(QMainWindow):
     overlay_state = pyqtSignal(str, str, bool)
+    response_poll_finished = pyqtSignal(object)
 
     @stage
     def __init__(self, cfg, token, user_data):
@@ -2693,6 +2751,12 @@ class MainWindow(QMainWindow):
         self._decrement_worker = None
         self._balance_worker = None
         self._hotkeys_registered = False
+        self._response_poll_busy = False
+        self.response_poll_finished.connect(self._apply_response_poll)
+        self._upload_failed = False
+        self.upload_deadline_timer = QTimer(self)
+        self.upload_deadline_timer.setSingleShot(True)
+        self.upload_deadline_timer.timeout.connect(self._upload_wait_expired)
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -3004,7 +3068,7 @@ class MainWindow(QMainWindow):
                 x_offset, 0,
                 p_width,
                 p_height,
-                SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW | 0x4000,  # SWP_ASYNCWINDOWPOS
             )
             if not positioned:
                 diag.event("win32.SetWindowPos.failed", error=ctypes.get_last_error())
@@ -3346,6 +3410,7 @@ class MainWindow(QMainWindow):
             native_diag.embed(sys.modules[__name__], int(hwnd), int(self.browser_placeholder.winId()))
             self.chrome_hwnd = hwnd
             self._sync_chrome_geometry()
+            diag.event("embed.geometry_requested", child=native_diag.snapshot(sys.modules[__name__], int(hwnd)))
         except Exception:
             diag.exception("MainWindow.embed")
             self.chrome_hwnd = None
@@ -3398,6 +3463,9 @@ class MainWindow(QMainWindow):
         return True
 
     def _on_prompt_loaded(self, success, payload):
+        if self._closing:
+            return
+        diag.event("prompt.prepared", success=bool(success))
         if success and isinstance(payload, dict):
             self.pdf_path = Path(payload.get("pdf", ""))
             self.template_path = Path(payload.get("template", "") or str(TEMPLATE_FILE))
@@ -3422,7 +3490,13 @@ class MainWindow(QMainWindow):
             self._load_prompt(force=True)
             return
 
+        if self.upload_thread and self.upload_thread.isRunning() and self.upload_thread._stop:
+            self._show_overlay("Предыдущая загрузка останавливается", "Перезапустите клиент перед повторной загрузкой.", error=True)
+            return
+        self._upload_failed = False
+        self.upload_deadline_timer.start(120000)
         if self.upload_thread and self.upload_thread.isRunning():
+            self.upload_thread.wait_started = time.monotonic()
             self.upload_thread.pdf_path = self.pdf_path
             self.upload_thread.template_path = self.template_path
             self.upload_thread.fails = 0
@@ -3444,10 +3518,35 @@ class MainWindow(QMainWindow):
         )
         self.upload_thread.decrement_signal.connect(self._on_decrement)
         self.upload_thread.attached.connect(self._on_files_attached)
+        self.upload_thread.failed.connect(self._on_upload_failed)
         self.upload_thread.start()
 
+    @pyqtSlot()
+    def _upload_wait_expired(self):
+        self._on_upload_failed("attachment_deadline")
+
+    @pyqtSlot(str)
+    def _on_upload_failed(self, reason):
+        if self._closing or self._upload_failed:
+            return
+        self._upload_failed = True
+        self.upload_deadline_timer.stop()
+        if self.upload_thread:
+            self.upload_thread.stop()
+        self.pdf_attached = False
+        diag.event("upload.failed", reason=reason)
+        self._show_overlay("Файлы не прикреплены", "Ожидание остановлено. Проверьте вход в Google и доступность чата. "
+                           "Для диагностики запустите с LEGALYZE_EXTERNAL_BROWSER=1. Логи: " + str(diag.LOG_DIR), error=True)
+
     def _on_files_attached(self, attached: bool):
+        if self._closing or self._upload_failed:
+            return
         attached = bool(attached)
+        if attached:
+            self.upload_deadline_timer.stop()
+        elif not self.upload_deadline_timer.isActive():
+            self.upload_deadline_timer.start(120000)
+        diag.event("upload.attachments_confirmed", complete=attached)
         if attached == self._last_attached_state:
             return
         self._last_attached_state = attached
@@ -3502,26 +3601,36 @@ class MainWindow(QMainWindow):
         self._decrement_worker.start()
 
     def _check_response_end_from_ui(self):
-        if not self.worker or not getattr(self.worker, "page", None):
+        if self._closing or self._response_poll_busy or not self.pdf_attached:
             return
+        page = getattr(self.worker, "page", None) if self.worker else None
+        if not page:
+            return
+        self._response_poll_busy = True
+        def task():
+            value = None
+            try:
+                value = int(page.eval(JS_CHECK_END, timeout=1).get("value") or 0)
+            except Exception:
+                diag.exception("response.poll")
+            finally:
+                self.response_poll_finished.emit(value)
+        threading.Thread(target=task, name="ResponsePoll", daemon=True).start()
 
-        try:
-            r = self.worker.page.eval(JS_CHECK_END, timeout=1)
-            current_markers_count = int(r.get("value") if isinstance(r, dict) else (r or 0))
-
-            if not hasattr(self, "_first_check_done"):
-                self._first_check_done = True
-                self._last_decremented_response_state = current_markers_count
-                return
-
-            if current_markers_count > self._last_decremented_response_state:
-                self._last_decremented_response_state = current_markers_count
-                self._on_decrement()
-            elif current_markers_count < self._last_decremented_response_state:
-                self._last_decremented_response_state = current_markers_count
-        except Exception:
-            diag.exception("main.py:3519")
-            pass
+    @pyqtSlot(object)
+    def _apply_response_poll(self, current_markers_count):
+        self._response_poll_busy = False
+        if self._closing or not self.pdf_attached or current_markers_count is None:
+            return
+        if not hasattr(self, "_first_check_done"):
+            self._first_check_done = True
+            self._last_decremented_response_state = current_markers_count
+            return
+        if current_markers_count > self._last_decremented_response_state:
+            self._last_decremented_response_state = current_markers_count
+            self._on_decrement()
+        elif current_markers_count < self._last_decremented_response_state:
+            self._last_decremented_response_state = current_markers_count
 
     def _on_decrement_finished(self, ok, remaining):
         if ok:
@@ -3557,6 +3666,10 @@ class MainWindow(QMainWindow):
             return
 
         self._cleaned = True
+        self.upload_deadline_timer.stop()
+        self.response_end_timer.stop()
+        self.topmost_timer.stop()
+        self.chrome_hwnd = None
 
         try:
             self.overlay.finish()

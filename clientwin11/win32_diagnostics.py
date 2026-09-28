@@ -38,6 +38,13 @@ def snapshot(m, hwnd):
     return result
 
 
+def eligible_browser_window(info):
+    """Never reparent a hidden startup/helper surface, even when it has a large rect."""
+    l, t, r, b = info['rect']
+    return (info.get('class') == 'Chrome_WidgetWin_1' and info.get('visible')
+            and not info.get('parent') and r-l >= 100 and b-t >= 100)
+
+
 _last_scan = 0
 
 def find_window(m, pids):
@@ -57,7 +64,7 @@ def find_window(m, pids):
             info['class'] = buf.value
             windows.append(info)
             l, t, r, b = info['rect']
-            if r-l >= 100 and b-t >= 100 and not info['parent']:
+            if eligible_browser_window(info):
                 candidates.append((info['visible'], buf.value == 'Chrome_WidgetWin_1', (r-l)*(b-t), int(hwnd)))
         except Exception:
             diag.exception('EnumWindows.callback')

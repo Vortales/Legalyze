@@ -80,6 +80,85 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(u.parent, 0x234567890)
 
 
+class BrowserRegressionTests(unittest.TestCase):
+    def test_rejects_hidden_helper_from_reported_windows_log(self):
+        info = {'class': 'Chrome_WidgetWin_0', 'visible': False, 'parent': 0,
+                'rect': [130, 130, 898, 649]}
+        self.assertFalse(native.eligible_browser_window(info))
+        info['visible'] = True
+        self.assertFalse(native.eligible_browser_window(info))
+        info['class'] = 'Chrome_WidgetWin_1'
+        self.assertTrue(native.eligible_browser_window(info))
+        info['visible'] = False
+        self.assertFalse(native.eligible_browser_window(info))
+        info['visible'], info['parent'] = True, 123
+        self.assertFalse(native.eligible_browser_window(info))
+
+    def test_page_probe_does_not_log_page_supplied_secrets(self):
+        from unittest.mock import Mock
+        tree = ast.parse((ROOT / 'main.py').read_text())
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'log_page_probe')
+        node.returns = None
+        for arg in node.args.args:
+            arg.annotation = None
+        namespace = {'diag': diag}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), 'page-probe', 'exec'), namespace)
+        page = Mock()
+        page.eval.return_value = {'value': {'category': 'PRIVATE', 'ready': 'PRIVATE',
+                                           'editors': 'PRIVATE', 'title': 'PRIVATE', 'fileInputs': 0}}
+        with patch.object(diag, 'event') as log:
+            namespace['log_page_probe'](page)
+        self.assertNotIn('PRIVATE', str(log.call_args))
+        self.assertEqual(log.call_args.kwargs['fileInputs'], 0)
+
+    def test_response_poll_is_single_flight_and_not_on_gui_thread(self):
+        import threading
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        tree = ast.parse((ROOT / 'main.py').read_text())
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'MainWindow')
+        node = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == '_check_response_end_from_ui')
+        namespace = {'threading': threading, 'diag': diag, 'JS_CHECK_END': 'probe'}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), 'response-poll', 'exec'), namespace)
+        started, release, finished = threading.Event(), threading.Event(), threading.Event()
+        ids = []
+        def evaluate(*args, **kwargs):
+            ids.append(threading.get_ident())
+            started.set()
+            release.wait(2)
+            return {'value': 3}
+        page = Mock()
+        page.eval.side_effect = evaluate
+        signal = Mock()
+        signal.emit.side_effect = lambda value: finished.set()
+        window = SimpleNamespace(_closing=False, _response_poll_busy=False, pdf_attached=True,
+                                  worker=SimpleNamespace(page=page), response_poll_finished=signal)
+        poll = namespace['_check_response_end_from_ui']
+        try:
+            poll(window)
+            self.assertTrue(started.wait(1))
+            poll(window)
+            self.assertEqual(page.eval.call_count, 1)
+            self.assertNotEqual(ids[0], threading.get_ident())
+        finally:
+            release.set()
+        self.assertTrue(finished.wait(1))
+        signal.emit.assert_called_once_with(3)
+
+    def test_attachment_worker_stops_at_deadline(self):
+        import time
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        tree = ast.parse((ROOT / 'main.py').read_text())
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'UploadThread')
+        node = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == 'run')
+        namespace = {'time': time, 'diag': diag}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), 'upload-loop', 'exec'), namespace)
+        worker = SimpleNamespace(_stop=False, wait_started=time.monotonic()-91, failed=Mock())
+        namespace['run'](worker)
+        worker.failed.emit.assert_called_once_with('attachment_deadline')
+
+
 class CDPTests(unittest.TestCase):
     def make_cdp(self):
         import threading
