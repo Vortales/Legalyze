@@ -38,6 +38,12 @@ def snapshot(m, hwnd):
     return result
 
 
+def staging_position(virtual_left, virtual_top, external=False):
+    # Keep WS_VISIBLE for reliable window discovery, but outside *all* monitors.
+    # Margin exceeds the requested 453x735 window (including normal high-DPI scaling).
+    return (80, 80) if external else (int(virtual_left) - 8192, int(virtual_top) - 8192)
+
+
 def eligible_browser_window(info):
     """Never reparent a hidden startup/helper surface, even when it has a large rect."""
     l, t, r, b = info['rect']
@@ -107,7 +113,7 @@ def embed(m, hwnd, parent):
             raise OSError(error, 'SetParent did not attach the browser')
         checked_style(m, hwnd, m.GWL_EXSTYLE,
                       (exstyle & ~(m.WS_EX_DLGMODALFRAME | m.WS_EX_WINDOWEDGE | m.WS_EX_CLIENTEDGE |
-                                   m.WS_EX_STATICEDGE | m.WS_EX_APPWINDOW)) | m.WS_EX_TOOLWINDOW)
+                                   m.WS_EX_STATICEDGE | m.WS_EX_APPWINDOW | 0x08000000)) | m.WS_EX_TOOLWINDOW)
         u.ShowWindow(hwnd, m.SW_SHOW)
         diag.event('embed.after', child=snapshot(m, hwnd))
     except Exception:

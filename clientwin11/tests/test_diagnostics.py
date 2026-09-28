@@ -19,6 +19,7 @@ os.environ['APPDATA'] = _TMP.name
 os.environ['HOME'] = _TMP.name
 import diagnostics as diag
 import win32_diagnostics as native
+import browser_focus
 
 
 class DiagnosticsTests(unittest.TestCase):
@@ -159,6 +160,77 @@ class BrowserRegressionTests(unittest.TestCase):
         worker.failed.emit.assert_called_once_with('attachment_deadline')
 
 
+class FocusAndStartupTests(unittest.TestCase):
+    def test_staging_is_outside_negative_origin_multimonitor_desktop(self):
+        x, y = native.staging_position(-3840, -2160)
+        self.assertLess(x + 453*4, -3840)
+        self.assertLess(y + 735*4, -2160)
+        self.assertEqual(native.staging_position(-3840, -2160, external=True), (80, 80))
+
+    def test_no_extra_startup_dialog(self):
+        source = (ROOT / 'main.py').read_text()
+        self.assertNotIn('startup = QDialog()', source)
+        self.assertIn('SW_SHOWNOACTIVATE', source)
+        self.assertIn('--window-position={staging_x},{staging_y}', source)
+
+    def fake_native(self):
+        from unittest.mock import Mock
+        u, k = Mock(), Mock()
+        u.GetForegroundWindow.return_value = 100
+        u.IsWindow.return_value = True
+        u.IsChild.side_effect = lambda root, child: root == 200 and child == 201
+        u.GetWindowThreadProcessId.return_value = 20
+        u.AttachThreadInput.return_value = True
+        u.SetFocus.return_value = 100
+        k.GetCurrentThreadId.return_value = 10
+        return u, k
+
+    def test_focus_joins_and_detaches_input_queues(self):
+        u, k = self.fake_native()
+        with patch.object(ctypes, 'set_last_error', create=True), \
+             patch.object(ctypes, 'get_last_error', return_value=0, create=True), \
+             patch.object(browser_focus, 'thread_focus', side_effect=lambda u, tid: {'focus': 100 if tid == 0 else 201}):
+            self.assertTrue(browser_focus.handoff(u, k, 100, 200, 201))
+        self.assertEqual([c.args for c in u.AttachThreadInput.call_args_list], [(10, 20, True), (10, 20, False)])
+        u.SetFocus.assert_called_once_with(201)
+
+    def test_focus_never_steals_from_other_application(self):
+        u, k = self.fake_native()
+        u.GetForegroundWindow.return_value = 999
+        self.assertFalse(browser_focus.handoff(u, k, 100, 200, 201))
+        u.AttachThreadInput.assert_not_called()
+        u.SetFocus.assert_not_called()
+
+    def test_focus_detaches_even_when_setfocus_raises(self):
+        u, k = self.fake_native()
+        u.SetFocus.side_effect = OSError('failed')
+        with patch.object(ctypes, 'set_last_error', create=True), \
+             patch.object(ctypes, 'get_last_error', return_value=0, create=True), \
+             patch.object(browser_focus, 'thread_focus', return_value={'focus': 100}):
+            with self.assertRaises(OSError):
+                browser_focus.handoff(u, k, 100, 200, 201)
+        self.assertEqual(u.AttachThreadInput.call_args.args, (10, 20, False))
+
+    def test_poll_does_not_repeatedly_focus_or_touch_qt_controls(self):
+        u, k = self.fake_native()
+        u.GetAsyncKeyState.side_effect = [0x8000, 0x8000, 0, 0x8000, 0, 0x8000]
+        u.GetCursorPos.return_value = True
+        u.WindowFromPoint.side_effect = [201, 300, 201]
+        bridge = browser_focus.BrowserFocusBridge(u, k)
+        with patch.object(browser_focus, 'handoff') as focus:
+            for _ in range(6):
+                bridge.poll(100, 200, True)
+        self.assertEqual(focus.call_count, 2)
+
+    def test_disabled_bridge_does_not_focus(self):
+        u, k = self.fake_native()
+        u.GetAsyncKeyState.return_value = 0x8000
+        bridge = browser_focus.BrowserFocusBridge(u, k)
+        with patch.object(browser_focus, 'handoff') as focus:
+            bridge.poll(100, 200, False)
+        focus.assert_not_called()
+
+
 class CDPTests(unittest.TestCase):
     def make_cdp(self):
         import threading
@@ -290,7 +362,7 @@ class QtTests(unittest.TestCase):
             from PyQt6.QtCore import Qt
             self.assertNotEqual(window.windowType(), Qt.WindowType.Tool)
             window.hide()
-            for timer in (window.init_timer, window.response_end_timer, window.topmost_timer):
+            for timer in (window.init_timer, window.response_end_timer, window.topmost_timer, window.focus_timer):
                 timer.stop()
             window.overlay.finish()
             window.deleteLater()

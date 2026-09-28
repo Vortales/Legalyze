@@ -6,6 +6,7 @@ import diagnostics as diag
 diag.setup()
 from diagnostics import stage
 import win32_diagnostics as native_diag
+import browser_focus
 
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -281,6 +282,7 @@ if kernel32:
 
 
 native_diag.configure(user32)
+browser_focus.configure(user32, kernel32)
 
 
 def get_window_long(hwnd, index):
@@ -615,6 +617,11 @@ def launch_chrome():
         raise FileNotFoundError("browser not found (no chromium next to exe)")
 
     threading.Thread(target=diag.inspect_browser, args=(browser_path,), name="BrowserInventory", daemon=True).start()
+    staging_x, staging_y = native_diag.staging_position(
+        user32.GetSystemMetrics(76) if user32 else 0,
+        user32.GetSystemMetrics(77) if user32 else 0,
+        external=os.environ.get("LEGALYZE_EXTERNAL_BROWSER") == "1")
+    diag.event("chromium.staging", x=staging_x, y=staging_y)
     args = [
         browser_path,
         f"--remote-debugging-port={port}",
@@ -635,7 +642,7 @@ def launch_chrome():
         "--disable-background-timer-throttling",
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",
-        "--window-position=80,80",
+        f"--window-position={staging_x},{staging_y}",
         "--remote-debugging-address=127.0.0.1",
         "--enable-logging",
         f"--log-file={diag.LOG_DIR / 'chromium.log'}",
@@ -645,7 +652,11 @@ def launch_chrome():
     if os.environ.get("LEGALYZE_DISABLE_GPU") == "1":
         args.append("--disable-gpu")
     creationflags = 0x08000000 if sys.platform == "win32" else 0
-    startupinfo = None  # Do not request SW_HIDE for a GUI browser.
+    startupinfo = None
+    if sys.platform == "win32":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 4  # SW_SHOWNOACTIVATE, not SW_HIDE: keep _1 discoverable.
     diag.event("chromium.launch", executable=browser_path, args=args, profile=str(PROFILE), port=port)
     with open(diag.LOG_DIR / "chromium-stdout.log", "ab") as stdout, open(diag.LOG_DIR / "chromium-stderr.log", "ab") as stderr:
         proc = subprocess.Popen(args, stdout=stdout, stderr=stderr,
@@ -1138,7 +1149,12 @@ def log_page_probe(page):
             bodyChildren: document.body ? document.body.children.length : 0,
             fileInputs: document.querySelectorAll('input[type="file"]').length,
             editors: document.querySelectorAll('textarea,[contenteditable="true"],[role="textbox"]').length,
-            frames: document.querySelectorAll('iframe').length};
+            frames: document.querySelectorAll('iframe').length,
+            documentFocused: document.hasFocus(),
+            activeEditable: !!(document.activeElement &&
+                (document.activeElement.isContentEditable || ['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName))),
+            activeReadOnly: !!(document.activeElement && document.activeElement.readOnly),
+            activeDisabled: !!(document.activeElement && document.activeElement.disabled)};
     })()"""
     try:
         raw = page.eval(script, timeout=2).get("value")
@@ -1148,9 +1164,11 @@ def log_page_probe(page):
             ready = raw.get("ready")
             counts = {key: raw[key] for key in ("bodyChildren", "fileInputs", "editors", "frames")
                       if type(raw.get(key)) is int and 0 <= raw[key] <= 1000000}
+            flags = {key: raw[key] for key in ("documentFocused", "activeEditable", "activeReadOnly", "activeDisabled")
+                     if type(raw.get(key)) is bool}
             diag.event("page.probe", category=category if category in
                        ("google_login", "google_consent", "google", "browser_error", "blank", "other") else "unknown",
-                       ready=ready if ready in ("loading", "interactive", "complete") else "unknown", **counts)
+                       ready=ready if ready in ("loading", "interactive", "complete") else "unknown", **counts, **flags)
     except Exception:
         diag.exception("page.probe")
 
@@ -2780,6 +2798,7 @@ class MainWindow(QMainWindow):
         self.browser_placeholder = QWidget(self.central_widget)
         self.browser_placeholder.setGeometry(0, 0, W, H)
         self.browser_placeholder.setStyleSheet(f"background: {THEME['bg']};")
+        self.browser_placeholder.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.browser_cover = QWidget(self.browser_placeholder)
         self.browser_cover.setGeometry(0, 0, W, H)
         self.browser_cover.setStyleSheet(f"background: {THEME['bg']};")
@@ -2808,6 +2827,10 @@ class MainWindow(QMainWindow):
         self.topmost_timer = QTimer(self)
         self.topmost_timer.timeout.connect(self._enforce_topmost)
         self.topmost_timer.start(1200)
+        self._focus_bridge = browser_focus.BrowserFocusBridge(user32, kernel32)
+        self.focus_timer = QTimer(self)
+        self.focus_timer.timeout.connect(self._poll_browser_focus)
+        self.focus_timer.start(30)
 
     def _build_chrome_ui(self):
         panel = f"background-color: {THEME['panel']};"
@@ -3004,6 +3027,15 @@ class MainWindow(QMainWindow):
     def _hide_overlay(self):
         self.overlay_state.emit("", "", False)
         self.browser_cover.hide()
+
+    def _poll_browser_focus(self):
+        enabled = (not self._closing and self.isVisible() and not self.isMinimized()
+                   and not self.overlay.isVisible() and not self.browser_cover.isVisible()
+                   and QApplication.activeModalWidget() is None)
+        try:
+            self._focus_bridge.poll(int(self.winId()), self.chrome_hwnd, enabled)
+        except Exception:
+            diag.exception("focus.poll")
 
     def _enforce_topmost(self):
         if self._closing or not self.isVisible():
@@ -3669,6 +3701,7 @@ class MainWindow(QMainWindow):
         self.upload_deadline_timer.stop()
         self.response_end_timer.stop()
         self.topmost_timer.stop()
+        self.focus_timer.stop()
         self.chrome_hwnd = None
 
         try:
@@ -3863,13 +3896,6 @@ def main():
     user_data = result["user"]
 
     diag.event("auth.accepted")
-    startup = QDialog()
-    startup.setWindowTitle("Legalyze — запуск")
-    layout = QVBoxLayout(startup)
-    layout.addWidget(QLabel("Авторизация выполнена. Проверка версии и создание главного окна…"))
-    layout.addWidget(QLabel("Журнал: " + str(diag.LOG_DIR)))
-    startup.show()
-    app.processEvents()
     _enforce_latest_version(token)
 
     if not get_template_filled(cfg):
@@ -3878,7 +3904,6 @@ def main():
             save_template(cfg, tpl_win.get_template())
 
     window = MainWindow(cfg, token, user_data)
-    startup.close()
     diag.place_window(window, app)
     window.show()
     window.raise_()
