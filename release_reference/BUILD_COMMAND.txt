@@ -1,0 +1,1 @@
+python -m nuitka --onefile --windows-console-mode=disable --enable-plugin=pyqt6 --include-package=requests --include-package=websocket --include-package=cryptography --include-package=fpdf --include-data-file=data/DejaVuSans.ttf=data/DejaVuSans.ttf --windows-icon-from-ico=icon.ico --assume-yes-for-downloads --output-dir=build --output-filename=Legalyze.exe main.py
