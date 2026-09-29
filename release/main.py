@@ -1823,14 +1823,15 @@ class LoginWindow(QDialog):
         self.cancel_btn.setObjectName("Ghost")
         self.cancel_btn.setDefault(False)
         self.cancel_btn.setAutoDefault(False)
-        self.cancel_btn.clicked.connect(self.reject)
+        self.cancel_btn.clicked.connect(lambda _checked=False: self.reject())
         btn_layout.addWidget(self.cancel_btn)
 
         self.login_btn = QPushButton("Войти")
         self.login_btn.setObjectName("Primary")
         self.login_btn.setDefault(False)
         self.login_btn.setAutoDefault(False)
-        self.login_btn.clicked.connect(self._do_login)
+        # Explicit bool discard: compiled Nuitka methods may bypass PyQt slot arity trimming.
+        self.login_btn.clicked.connect(lambda _checked=False: self._do_login())
         btn_layout.addWidget(self.login_btn)
 
         layout.addLayout(btn_layout)
@@ -2033,7 +2034,7 @@ class TemplateWindow(QDialog):
         btn.setObjectName("Primary")
         btn.setMinimumHeight(46)
         btn.setMinimumWidth(200)
-        btn.clicked.connect(self._save)
+        btn.clicked.connect(lambda _checked=False: self._save())
 
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
@@ -2041,7 +2042,7 @@ class TemplateWindow(QDialog):
         cancel_btn.setObjectName("Ghost")
         cancel_btn.setMinimumHeight(46)
         cancel_btn.setMinimumWidth(200)
-        cancel_btn.clicked.connect(self.reject)
+        cancel_btn.clicked.connect(lambda _checked=False: self.reject())
         btn_layout.addWidget(cancel_btn)
         btn_layout.addWidget(btn)
         btn_layout.addStretch()
@@ -2130,12 +2131,12 @@ class HotkeyDialog(QDialog):
 
         cancel_btn = QPushButton("Отмена")
         cancel_btn.setObjectName("Ghost")
-        cancel_btn.clicked.connect(self.reject)
+        cancel_btn.clicked.connect(lambda _checked=False: self.reject())
         btn_layout.addWidget(cancel_btn)
 
         self.ok_btn = QPushButton("Применить")
         self.ok_btn.setObjectName("Primary")
-        self.ok_btn.clicked.connect(self._accept_if_valid)
+        self.ok_btn.clicked.connect(lambda _checked=False: self._accept_if_valid())
         btn_layout.addWidget(self.ok_btn)
 
         layout.addLayout(btn_layout)
@@ -2234,7 +2235,7 @@ class HotkeyChip(QWidget):
         self.button.setSizePolicy(QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Fixed)
         self.button.setCursor(Qt.CursorShape.PointingHandCursor)
         self._apply_style(False)
-        self.button.clicked.connect(self.clicked.emit)
+        self.button.clicked.connect(lambda _checked=False: self.clicked.emit())
         lay.addWidget(self.button)
 
     def _apply_style(self, active: bool):
@@ -2755,12 +2756,12 @@ class PromptSelectionWindow(QDialog):
 
         cancel_btn = QPushButton("Отмена")
         cancel_btn.setObjectName("Ghost")
-        cancel_btn.clicked.connect(self.reject)
+        cancel_btn.clicked.connect(lambda _checked=False: self.reject())
         btn_layout.addWidget(cancel_btn)
 
         ok_btn = QPushButton("Выбрать")
         ok_btn.setObjectName("Primary")
-        ok_btn.clicked.connect(self._on_accept)
+        ok_btn.clicked.connect(lambda _checked=False: self._on_accept())
         btn_layout.addWidget(ok_btn)
 
         layout.addLayout(btn_layout)
@@ -2934,11 +2935,11 @@ class MainWindow(QMainWindow):
         # ── чипы горячих клавиш с подписями ──
         self.chip_mic = HotkeyChip("Микрофон", self.cfg.get("hotkey_mic", "F3"))
         self.chip_mic.button.setEnabled(True)
-        self.chip_mic.clicked.connect(self._choose_mic_hotkey)
+        self.chip_mic.clicked.connect(lambda _checked=False: self._choose_mic_hotkey())
         top_layout.addWidget(self.chip_mic)
 
         self.chip_toggle = HotkeyChip("Окно", self.cfg.get("hotkey_toggle", "F2"))
-        self.chip_toggle.clicked.connect(self._choose_hotkey)
+        self.chip_toggle.clicked.connect(lambda _checked=False: self._choose_hotkey())
         top_layout.addWidget(self.chip_toggle)
 
         sep = QLabel("")
@@ -2950,21 +2951,21 @@ class MainWindow(QMainWindow):
         self.btn_template.setToolTip("Данные шаблона")
         self.btn_template.setStyleSheet(icon_btn)
         self.btn_template.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_template.clicked.connect(self._open_template)
+        self.btn_template.clicked.connect(lambda _checked=False: self._open_template())
         top_layout.addWidget(self.btn_template)
 
         self.btn_prompt = QPushButton("Промт")
         self.btn_prompt.setToolTip("Выбор промта")
         self.btn_prompt.setStyleSheet(icon_btn)
         self.btn_prompt.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_prompt.clicked.connect(self._choose_prompt)
+        self.btn_prompt.clicked.connect(lambda _checked=False: self._choose_prompt())
         top_layout.addWidget(self.btn_prompt)
 
         btn_restart = QPushButton("⟳")
         btn_restart.setToolTip("Перезапуск")
         btn_restart.setStyleSheet(icon_btn)
         btn_restart.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_restart.clicked.connect(self._restart)
+        btn_restart.clicked.connect(lambda _checked=False: self._restart())
         top_layout.addWidget(btn_restart)
 
         btn_close = QPushButton("✕")
@@ -2982,7 +2983,7 @@ class MainWindow(QMainWindow):
             }}
             QPushButton:hover {{ background: rgba(239, 68, 68, 0.55); color: #fff; }}
         """)
-        btn_close.clicked.connect(self._close_app)
+        btn_close.clicked.connect(lambda _checked=False: self._close_app())
         top_layout.addWidget(btn_close)
 
         self.overlay_left = QWidget(self.central_widget)

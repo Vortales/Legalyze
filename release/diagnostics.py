@@ -119,7 +119,9 @@ def setup():
             versions[package] = 'not in metadata'
     event('session.start', platform=platform.platform(), python=sys.version,
           bitness=ctypes.sizeof(ctypes.c_void_p)*8, executable=sys.executable,
-          cwd=str(Path.cwd()), frozen=bool(getattr(sys, 'frozen', False)), packages=versions,
+          cwd=str(Path.cwd()), frozen=bool(getattr(sys, 'frozen', False)),
+          nuitka_compiled=('__compiled__' in globals()),
+          release_revision='qt-click-adapters-v1', packages=versions,
           windows_build=str(sys.getwindowsversion()) if sys.platform == 'win32' else None,
           modes={k: os.environ.get(k) for k in ('LEGALYZE_DISABLE_GPU', 'LEGALYZE_EXTERNAL_BROWSER',
                                                 'LEGALYZE_FRESH_PROFILE')})
