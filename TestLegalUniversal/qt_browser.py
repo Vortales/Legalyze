@@ -20,10 +20,13 @@ from PyQt6.QtWebEngineCore import (QWebEnginePage, QWebEngineProfile,
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 import diagnostics as diag
 from speech_backend import DictationEngine
-from web_compat import UA_BRAND_JS, SPEECH_SHIM_JS, CHANNEL_INIT_JS, CAPABILITY_JS
+from web_compat import (UA_BRAND_JS, SPEECH_SHIM_JS, CHANNEL_INIT_JS, CAPABILITY_JS,
+                        JS_PURGE, CONSENT_AUTOCLICK_JS, QWEBCHANNEL_LITE_JS)
 
 HOME = 'https://google.com/ai'
 ALLOWED_HOSTS = {'google.com', 'www.google.com', 'gemini.google.com'}
+# Native page zoom, identical to Chrome's "67%" step (2/3) used before.
+ZOOM_FACTOR = 2.0 / 3.0
 READY_SCRIPT = """(() => {
     if (location.protocol !== 'https:' ||
         !['google.com','www.google.com','gemini.google.com'].includes(location.hostname)) return false;
@@ -34,7 +37,7 @@ READY_SCRIPT = """(() => {
 
 
 def load_qwebchannel_js():
-    """Official Qt qwebchannel.js, from the Qt resource system or installation."""
+    """Official Qt qwebchannel.js from the resource system, else the lite client."""
     try:
         f = QFile(':/qtwebchannel/qwebchannel.js')
         if f.open(QFile.OpenModeFlag.ReadOnly):
@@ -56,7 +59,7 @@ def load_qwebchannel_js():
                     return candidate.read_text(encoding='utf-8')
     except Exception:
         diag.exception('qt_browser.qwebchannel_file')
-    return None
+    return QWEBCHANNEL_LITE_JS
 
 
 class SpeechBridge(QObject):
@@ -137,6 +140,7 @@ class BrowserPane(QWidget):
         self.profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.AllowPersistentCookies)
         self._normalize_user_agent()
         self.view = QWebEngineView(self)
+        self.view.setZoomFactor(ZOOM_FACTOR)  # before the first load: no zoom flash
         self.page = QWebEnginePage(self.profile, self.view)
         self.view.setPage(self.page)
         layout = QVBoxLayout(self)
@@ -147,6 +151,7 @@ class BrowserPane(QWidget):
         self.page.newWindowRequested.connect(lambda request: request.openIn(self.page))
         self.page.renderProcessTerminated.connect(self._terminated)
         self.view.loadFinished.connect(self._load_finished)
+        self.view.loadStarted.connect(lambda: self.view.setZoomFactor(ZOOM_FACTOR))
         self._setup_speech_bridge()
         self._install_page_scripts()
         for shortcut, callback in [('Ctrl+R', self.view.reload), ('F5', self.view.reload),
@@ -177,14 +182,16 @@ class BrowserPane(QWidget):
         self.page.setWebChannel(self.channel)
 
     def _install_page_scripts(self):
-        chunks = [UA_BRAND_JS, SPEECH_SHIM_JS]
+        # Everything runs at document creation: no flash of unhidden chrome,
+        # zoom already applied, speech surface present before site scripts.
+        chunks = [UA_BRAND_JS, SPEECH_SHIM_JS, CONSENT_AUTOCLICK_JS, JS_PURGE]
         channel_js = load_qwebchannel_js()
-        if channel_js:
-            chunks.append(channel_js)
-            chunks.append(CHANNEL_INIT_JS)
-            diag.event('webengine.qwebchannel_ok')
+        chunks.append(channel_js)
+        chunks.append(CHANNEL_INIT_JS)
+        if channel_js is QWEBCHANNEL_LITE_JS:
+            diag.event('webengine.qwebchannel_lite')
         else:
-            diag.event('webengine.qwebchannel_missing')
+            diag.event('webengine.qwebchannel_ok')
         source = '\n'.join(chunks)
         script = QWebEngineScript()
         script.setName('legalyze-compat')

@@ -5,4 +5,3 @@ websocket-client>=1.7,<2
 cryptography>=42
 fpdf2>=2.7,<3
 PyQt6-WebEngine>=6.8,<7
-PyQt6-WebChannel>=6.8,<7

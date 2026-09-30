@@ -79,10 +79,11 @@ class GlobalHotkeys:
         with self._lock:
             self._desired[HOTKEY_TOGGLE_ID] = int(toggle_vk or 0)
             self._desired[HOTKEY_MIC_ID] = int(mic_vk or 0)
-        if not self._thread or not self._hwnd:
+        if not self._thread:
             return False
         user32, _ = _win_dlls()
-        user32.PostMessageW(wintypes.HWND(self._hwnd), WM_APP_RECONFIGURE, 0, 0)
+        if user32 and self._hwnd:
+            user32.PostMessageW(wintypes.HWND(self._hwnd), WM_APP_RECONFIGURE, 0, 0)
         time.sleep(0.15)  # the message loop registers synchronously on this message
         return self.is_registered()
 
@@ -123,6 +124,14 @@ class GlobalHotkeys:
             wndproc_t = ctypes.WINFUNCTYPE(ctypes.c_long, wintypes.HWND, ctypes.c_uint,
                                           wintypes.WPARAM, wintypes.LPARAM)
         wndproc = wndproc_t(self._wnd_proc)
+
+        try:
+            user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                              wintypes.WPARAM, wintypes.LPARAM]
+            user32.DefWindowProcW.restype = ctypes.c_long
+        except Exception:
+            diag.exception("win32_hotkeys.defwindowproc")
+
         hinstance = kernel32.GetModuleHandleW(None)
 
         wc = wintypes.WNDCLASSW()
@@ -133,31 +142,33 @@ class GlobalHotkeys:
         if not atom:
             diag.event("hotkeys.register_class_failed", error=ctypes.get_last_error())
 
-        hwnd = user32.CreateWindowExW(
-            0, wintypes.LPWSTR(class_name), "LegalyzeHotkeys",
-            0, 0, 0, 0, 0, HWND_MESSAGE, None, wintypes.HINSTANCE(hinstance), None)
+        hwnd = 0
+        try:
+            created = user32.CreateWindowExW(
+                0, wintypes.LPWSTR(class_name), "LegalyzeHotkeys",
+                0, 0, 0, 0, 0, HWND_MESSAGE, None, wintypes.HINSTANCE(hinstance), None)
+            hwnd = int(created or 0)
+        except Exception:
+            diag.exception("win32_hotkeys.create_window")
+        self._hwnd = hwnd
         if not hwnd:
-            diag.event("hotkeys.create_window_failed", error=ctypes.get_last_error())
-            self._ready.set()
-            self._emit_status(False, "Окно горячих клавиш не создано")
-            return
-
-        self._hwnd = int(hwnd)
+            # Polling fallback must keep working even without a message window.
+            diag.event("hotkeys.window_failed", error=ctypes.get_last_error())
+        else:
+            diag.event("hotkeys.service_started", hwnd=hwnd)
         self._ready.set()
-        diag.event("hotkeys.service_started", hwnd=self._hwnd)
 
         msg = wintypes.MSG()
         try:
             while self._running:
-                has_msg = False
-                while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
-                    has_msg = True
-                    if msg.message == 0x0012:  # WM_QUIT
-                        self._running = False
-                        break
-                    self._dispatch(msg.message, int(msg.wParam or 0))
-                    user32.TranslateMessage(ctypes.byref(msg))
-                    user32.DispatchMessageW(ctypes.byref(msg))
+                if hwnd:
+                    while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
+                        if msg.message == 0x0012:  # WM_QUIT
+                            self._running = False
+                            break
+                        self._dispatch(msg.message, int(msg.wParam or 0))
+                        user32.TranslateMessage(ctypes.byref(msg))
+                        user32.DispatchMessageW(ctypes.byref(msg))
                 if not self._running:
                     break
                 now = time.monotonic()
@@ -169,9 +180,10 @@ class GlobalHotkeys:
         finally:
             try:
                 for key_id in list(self._registered):
-                    user32.UnregisterHotKey(wintypes.HWND(self._hwnd), key_id)
+                    user32.UnregisterHotKey(wintypes.HWND(hwnd), key_id)
                 self._registered.clear()
-                user32.DestroyWindow(wintypes.HWND(self._hwnd))
+                if hwnd:
+                    user32.DestroyWindow(wintypes.HWND(hwnd))
                 user32.UnregisterClassW(wintypes.LPWSTR(class_name), wintypes.HINSTANCE(hinstance))
             except Exception:
                 diag.exception("win32_hotkeys.cleanup")
@@ -179,7 +191,15 @@ class GlobalHotkeys:
             diag.event("hotkeys.service_stopped")
 
     def _wnd_proc(self, hwnd, msg, wparam, lparam):
-        return 0  # messages are dispatched from the polling loop above
+        # Messages are consumed by the PeekMessage loop; DefWindowProc is still
+        # required here: returning 0 for WM_NCCREATE aborts CreateWindowExW.
+        user32, _ = _win_dlls()
+        if user32:
+            try:
+                return int(user32.DefWindowProcW(hwnd, msg, wparam, lparam) or 0)
+            except Exception:
+                diag.exception("win32_hotkeys.wnd_proc")
+        return 0
 
     def _dispatch(self, message, wparam):
         if message == WM_APP_RECONFIGURE:
@@ -200,7 +220,7 @@ class GlobalHotkeys:
 
     def _apply_keys(self):
         user32, _ = _win_dlls()
-        if not user32 or not self._hwnd:
+        if not user32:
             return
         with self._lock:
             desired = dict(self._desired)
@@ -214,6 +234,9 @@ class GlobalHotkeys:
                 user32.UnregisterHotKey(wintypes.HWND(self._hwnd), key_id)
                 self._registered.pop(key_id, None)
             if not vk:
+                continue
+            if not self._hwnd:
+                problems.append((key_id, vk))  # polling fallback only
                 continue
             ok = bool(user32.RegisterHotKey(wintypes.HWND(self._hwnd), key_id,
                                             MOD_NOREPEAT, vk))

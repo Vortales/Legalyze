@@ -91,12 +91,17 @@ class SourceTests(unittest.TestCase):
         self.assertNotIn('|| document.body;', ast.unparse(upload))
 
     def test_purge_protects_input_and_microphone(self):
-        purge = literal('JS_PURGE', 'main.py')
+        purge = literal('JS_PURGE', 'web_compat.py')
         self.assertIn('isProtected', purge)
         self.assertIn('PROTECTED_LABEL', purge)
-        self.assertNotIn("'svg[width=\"26\"]", purge)
+        self.assertIn('svg[width="26"][height="26"][viewBox="0 0 24 24"]', purge)
         for token in ('input-plate', 'икрофон', 'voice'):
             self.assertIn(token, purge)
+
+    def test_requirements_have_no_invented_package(self):
+        text = (ROOT / 'requirements.txt').read_text()
+        self.assertNotIn('PyQt6-WebChannel', text)  # QtWebChannel ships inside PyQt6
+        self.assertIn('PyQt6-WebEngine', text)
 
     def test_hotkey_service_is_thread_independent(self):
         tree = ast.parse((ROOT / 'win32_hotkeys.py').read_text())
@@ -105,6 +110,13 @@ class SourceTests(unittest.TestCase):
         self.assertIn('GetAsyncKeyState', source)
         self.assertIn('HWND_MESSAGE', source)
         self.assertIn('PeekMessageW', source)
+        self.assertIn('DefWindowProcW', source)  # WM_NCCREATE-safe window proc
+
+    def test_zoom_restored_to_native_67(self):
+        source = (ROOT / 'qt_browser.py').read_text()
+        self.assertIn('ZOOM_FACTOR = 2.0 / 3.0', source)
+        self.assertIn('setZoomFactor(ZOOM_FACTOR)', source)
+        self.assertIn('JS_PURGE', source)  # early purge: no flash of site chrome
 
 
 class SpeechBackendTests(unittest.TestCase):
@@ -357,8 +369,8 @@ console.log('caps ok');
 '''
         self.run_node(harness.replace('CAPS', json.dumps(literal('CAPABILITY_JS'))))
 
-    def test_purge_hides_header_but_never_mic(self):
-        purge = literal('JS_PURGE', 'main.py')
+    def test_purge_hides_header_and_logo_but_never_mic(self):
+        purge = literal('JS_PURGE', 'web_compat.py')
         harness = '''
 const vm = require('vm');
 function el(name, opts) {
@@ -366,7 +378,7 @@ function el(name, opts) {
   const self = {
     nodeType: 1,
     name: name,
-    style: {setProperty: (k, v) => { self.hiddenStyle = k + ':' + v; }},
+    style: {setProperty: (k, v) => { self.hiddenStyle = (self.hiddenStyle || '') + k + ':' + v + ';'; }},
     hiddenStyle: '',
     removed: false,
     remove() { self.removed = true; },
@@ -392,11 +404,12 @@ function el(name, opts) {
   return self;
 }
 const header = el('header', {matches: ['header#gb']});
-const svgIcon = el('svg', {matches: []});
+const logoSvg = el('svg', {matches: ['svg[width="26"][height="26"][viewBox="0 0 24 24"]']});
 const form = el('form', {inputArea: true});
 const mic = el('button', {parent: form, label: 'Микрофон', xid: 'input-plate-voice-button', matches: ['div.eT9Cje']});
+const micIcon = el('svg', {parent: mic, matches: ['svg[width="26"][height="26"][viewBox="0 0 24 24"]']});
 const send = el('button', {parent: form, label: 'Отправить', matches: ['div.qEn1od']});
-const root = el('html', {all: [header, svgIcon, mic, send]});
+const root = el('html', {all: [header, logoSvg, mic, micIcon, send]});
 const sandbox = {
   window: {addEventListener() {}},
   document: {documentElement: root, addEventListener() {}},
@@ -408,12 +421,104 @@ vm.createContext(sandbox);
 vm.runInContext(PURGE, sandbox);
 sandbox.window.__purgeRun();
 if (!header.hiddenStyle || !header.removed) throw Error('header must be hidden');
+if (!logoSvg.hiddenStyle || !logoSvg.removed) throw Error('G-logo svg must be hidden');
 if (mic.hiddenStyle || mic.removed) throw Error('mic must survive purge even when matching');
+if (micIcon.hiddenStyle || micIcon.removed) throw Error('mic icon must survive purge even when matching logo selector');
 if (send.hiddenStyle || send.removed) throw Error('send must survive purge even when matching');
-if (svgIcon.hiddenStyle || svgIcon.removed) throw Error('generic svg must survive purge');
 console.log('purge ok');
 '''
         self.run_node(harness.replace('PURGE', json.dumps(purge)))
+
+    def test_consent_autoclick_accepts_only_consent_surfaces(self):
+        harness = '''
+const vm = require('vm');
+function button(label, opts) {
+  opts = opts || {};
+  const el = {
+    nodeType: 1,
+    _label: label, _parent: opts.parent || null, clicked: 0,
+    innerText: label, value: '',
+    getAttribute(n) { return n === 'aria-label' ? el._label : null; },
+    closest(sel) {
+      let n = el;
+      while (n) { if (n._isDialog) return n; n = n._parent; }
+      return null;
+    },
+    click() { el.clicked++; }
+  };
+  return el;
+}
+const dialog = {nodeType: 1, _isDialog: true, _parent: null};
+const accept = button('Принять все', {parent: dialog});
+const random = button('Отправить', {parent: dialog});
+const floating = button('Accept all');
+const root = {
+  nodeType: 1,
+  querySelectorAll() { return [accept, random, floating]; },
+  matches() { return false; }
+};
+const sandbox = {
+  window: {addEventListener() {}},
+  document: {body: {}, documentElement: root, addEventListener() {},
+             querySelectorAll: (s) => root.querySelectorAll(s)},
+  location: {hostname: 'gemini.google.com'},
+  setInterval: (fn) => { fn(); return 1; }, clearInterval: () => {},
+  console
+};
+sandbox.window.window = sandbox.window;
+vm.createContext(sandbox);
+vm.runInContext(CONSENT, sandbox);
+if (accept.clicked !== 1) throw Error('consent accept must be clicked, got ' + accept.clicked);
+if (random.clicked !== 0) throw Error('unrelated button must not be clicked');
+if (floating.clicked !== 0) throw Error('bare Accept outside consent surface must not be clicked');
+console.log('consent ok');
+'''
+        self.run_node(harness.replace('CONSENT', json.dumps(literal('CONSENT_AUTOCLICK_JS'))))
+
+    def test_webchannel_lite_matches_qt_protocol(self):
+        harness = '''
+const vm = require('vm');
+const sent = [];
+const handlers = {};
+const transport = {
+  send(raw) {
+    const msg = JSON.parse(raw);
+    sent.push(msg);
+    if (msg.type === 3) {
+      transport.onmessage({data: JSON.stringify({type: 10, id: msg.id, data: {
+        legalyzeSpeech: {
+          id: 'legalyzeSpeech',
+          methods: [['start', 0], ['stop', 1], ['abort', 2], ['reportCapabilities', 3]],
+          signals: [['started', 0], ['hypothesis', 1], ['result', 2], ['error', 3], ['ended', 4]],
+          properties: [], enums: {}
+        }
+      }})});
+    }
+  },
+  onmessage: null
+};
+const sandbox = {window: {}, console, JSON};
+vm.createContext(sandbox);
+vm.runInContext(LITE, sandbox);
+let bridge = null;
+new sandbox.window.QWebChannel(transport, (ch) => { bridge = ch.objects.legalyzeSpeech; });
+if (!bridge) throw Error('init handshake failed');
+if (!sent.some(m => m.type === 3)) throw Error('init message');
+if (!sent.some(m => m.type === 4)) throw Error('idle after init');
+const started = [];
+bridge.started.connect(() => started.push(1));
+if (!sent.some(m => m.type === 7 && m.signal === 0)) throw Error('connectToSignal');
+transport.onmessage({data: JSON.stringify({type: 1, object: 'legalyzeSpeech', signal: 0, args: []})});
+if (started.length !== 1) throw Error('signal dispatch');
+let reply = null;
+bridge.start('ru-RU', true, false, (v) => { reply = v; });
+const invoke = sent.find(m => m.type === 6);
+if (!invoke || invoke.method !== 'start' || invoke.args[0] !== 'ru-RU') throw Error('invokeMethod shape');
+transport.onmessage({data: JSON.stringify({type: 10, id: invoke.id, data: 'ok'})});
+if (reply !== 'ok') throw Error('response dispatch');
+console.log('webchannel lite ok');
+'''
+        self.run_node(harness.replace('LITE', json.dumps(literal('QWEBCHANNEL_LITE_JS'))))
 
     def test_compatibility_bundle_parses(self):
         qwebchannel_stub = '''var qt = {webChannelTransport: {}};

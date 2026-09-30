@@ -339,6 +339,7 @@ MODIFIER_MAP = {
 }
 
 from win32_hotkeys import GlobalHotkeys, HOTKEY_TOGGLE_ID, HOTKEY_MIC_ID
+from web_compat import JS_PURGE
 
 THEME = {
     "bg": "#0e1020",
@@ -573,106 +574,6 @@ def grant_mic_permission(browser: CDP, page: CDP):
             pass
 
 
-JS_PURGE = r"""
-(() => {
-    if (window.__purgeInstalled) {
-        if (window.__purgeRun) window.__purgeRun();
-        return;
-    }
-
-    window.__purgeInstalled = true;
-
-    const SELECTORS = [
-        'div.qEn1od[jsname="NlVIob"]',
-        'div.qEn1od',
-        'div.P3mIxe.Hw60ud',
-        'div.FSUH7d[jsname="xcvsnc"]',
-        'div.GG4mbd[role="navigation"]',
-        'div.eT9Cje',
-        'span.gb',
-        'div[jscontroller="SJpD2c"][jsname="uZkjhb"]',
-        'header#gb',
-        'div#gbwa',
-        'g-snackbar[jsname="PWj1Zb"]'
-    ];
-
-    const S = SELECTORS.join(',');
-
-    // Никогда не трогаем панель ввода, микрофон, отправку и файлы.
-    const INPUT_AREA = 'form, footer, .esoFne, .Txyg0d, .CEpIFc, [role="region"], [data-xid*="input-plate"]';
-    const PROTECTED_LABEL = /икрофон|микрофон|mic|voice|голос|отправ|send|dictat|дикт|вопрос|attach|прикреп|файл|file/i;
-    const isProtected = (el) => {
-        try {
-            if (!el || el.nodeType !== 1) return true;
-            if (el.closest && el.closest(INPUT_AREA)) return true;
-            const label = ((el.getAttribute && (el.getAttribute('aria-label') || el.getAttribute('data-xid') || el.getAttribute('title'))) || '');
-            if (PROTECTED_LABEL.test(label)) return true;
-            const text = (el.textContent || '').slice(0, 120);
-            if (PROTECTED_LABEL.test(text)) return true;
-            return false;
-        } catch (e) { return true; }
-    };
-
-    const hide = (el) => {
-        if (!el || isProtected(el)) return;
-        if (el.style) {
-            el.style.setProperty('display', 'none', 'important');
-            el.style.setProperty('visibility', 'hidden', 'important');
-        }
-        try { el.remove(); } catch (e) {}
-    };
-
-    const kill = (node) => {
-        if (!node || node.nodeType !== 1) return;
-
-        if (node.matches && node.matches(S)) {
-            hide(node);
-            return;
-        }
-
-        if (node.querySelectorAll) {
-            const list = node.querySelectorAll(S);
-            for (let i = list.length - 1; i >= 0; i--) hide(list[i]);
-        }
-    };
-
-    window.__purgeRun = () => kill(document.documentElement);
-
-    const obs = new MutationObserver((mutations) => {
-        for (const m of mutations) {
-            if (m.type === 'childList') {
-                for (const n of m.addedNodes) kill(n);
-            } else if (m.type === 'attributes') {
-                kill(m.target);
-            }
-        }
-    });
-
-    const start = () => {
-        const root = document.documentElement;
-        if (!root) return false;
-
-        obs.observe(root, {
-            childList: true,
-            subtree: true,
-            attributes: true,
-            attributeFilter: ['class', 'id', 'jsname', 'jscontroller']
-        });
-
-        kill(root);
-        return true;
-    };
-
-    if (!start()) {
-        const t = setInterval(() => {
-            if (start()) clearInterval(t);
-        }, 10);
-    }
-
-    document.addEventListener('DOMContentLoaded', () => kill(document.documentElement), { once: true });
-    window.addEventListener('load', () => kill(document.documentElement), { once: true });
-})();
-"""
 
 # Детект файлов в чате Google AI
 JS_CHECK_FILES = r"""

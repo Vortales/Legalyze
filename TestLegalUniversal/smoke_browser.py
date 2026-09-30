@@ -12,7 +12,7 @@ from pathlib import Path
 
 from PyQt6.QtCore import QUrl, QTimer
 from PyQt6.QtWidgets import QApplication
-from qt_browser import BrowserPane, READY_SCRIPT
+from qt_browser import BrowserPane, READY_SCRIPT, ZOOM_FACTOR
 from web_compat import CAPABILITY_JS
 from storage_paths import app_dir
 import diagnostics as diag
@@ -69,7 +69,7 @@ def main():
     def finish():
         for name, ok in results.items():
             print(('PASS ' if ok else 'FAIL ') + name)
-        ok = all(results.values()) and len(results) == len(STEPS)
+        ok = all(results.values()) and len(results) == len(STEPS) + 1
         print('SMOKE', 'OK' if ok else 'FAILED')
         app.quit()
         pane.shutdown()
@@ -98,6 +98,7 @@ def main():
         QTimer.singleShot(300, lambda: step(0))
 
     pane.view.loadFinished.connect(loaded)
+    results['zoom_native_67'] = abs(float(pane.view.zoomFactor()) - ZOOM_FACTOR) < 0.001
     pane.view.setHtml(TEST_HTML, QUrl('https://google.com/ai'))
     QTimer.singleShot(30000, lambda: fail('timeout'))
     app.exec()
