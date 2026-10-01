@@ -1,9 +1,12 @@
 import ast
+import builtins
+import contextlib
 import io
 import json
 from pathlib import Path
 import shutil
 import subprocess
+import symtable
 import threading
 import sys
 import time
@@ -227,6 +230,25 @@ class SourceTests(unittest.TestCase):
         # Зум 67 % как в рабочей сборке (уровень зума Chromium -2.2239 = 2/3).
         self.assertAlmostEqual(native_browser.ZOOM, 2.0 / 3.0, delta=1e-9)
 
+    def test_viewport_is_re_pinned_after_a_reload(self):
+        # Метрики сбрасываются при смене таргета/перезагрузке — тогда чат
+        # снова рисует широкую desktop-раскладку с одним «ИИ» по центру.
+        self.assertTrue(native_browser.verify_viewport(FakeCDPPage([680, 1102, 1]), 453, 735))
+        self.assertFalse(native_browser.verify_viewport(FakeCDPPage([1280, 1102, 1]), 453, 735))
+        source = (ROOT / 'main.py').read_text()
+        tree = ast.parse(source)
+        guard = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'MainWindow')
+        methods = {m.name: m for m in guard.body if isinstance(m, ast.FunctionDef)}
+        self.assertIn('_ensure_viewport', methods)
+        body = ast.unparse(methods['_ensure_viewport'])
+        self.assertIn('verify_viewport(page, W, H)', body)
+        self.assertIn('apply_viewport(page, W, H)', body)
+        self.assertIn('daemon=True', body)          # GUI не блокируется
+        ready = ast.unparse(methods['_on_browser_ready'])
+        self.assertIn('viewport_timer', ready)
+        cleanup = ast.unparse(methods['_cleanup'])
+        self.assertIn('viewport_timer', cleanup)
+
     def test_consent_walls_are_never_automated(self):
         # В ЕС (Испания) свежий профиль сначала отдаёт consent.google.com.
         # Прежний выбор цели брал «любую страницу google.com» и встаивался
@@ -292,6 +314,105 @@ class SourceTests(unittest.TestCase):
                                                  'https://google.com/ai', 453, 735,
                                                  gpu=False))
         self.assertIn('--disable-gpu', off)
+
+    def _fetch_chrome(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('fetch_chrome', ROOT / 'tools' / 'fetch_chrome.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_fetch_chrome_picks_the_branded_win64_build(self):
+        fetch = self._fetch_chrome()
+        index = {'channels': {'Stable': {'version': '140.0.7339.207', 'downloads': {'chrome': [
+            {'platform': 'linux64', 'url': 'https://x/linux.zip'},
+            {'platform': 'win64', 'url': 'https://x/chrome-win64.zip'},
+        ]}}}}
+        version, url = fetch.pick_url(index)
+        self.assertEqual(version, '140.0.7339.207')
+        self.assertTrue(url.endswith('chrome-win64.zip'))
+        with self.assertRaises(SystemExit):
+            fetch.pick_url(index, platform='win32')
+
+    def test_fetch_chrome_fails_friendly_without_the_network(self):
+        fetch = self._fetch_chrome()
+
+        class DeadRequest:
+            ProxyHandler = staticmethod(lambda *a, **k: None)
+
+            def build_opener(self, *a, **k):
+                raise OSError('TLS/SSL connection has been closed')
+
+        with patch.object(fetch, 'urllib', SimpleNamespace(request=DeadRequest())):
+            with self.assertRaises(fetch.FetchError) as caught:
+                fetch.main(['--dry-run'])
+        message = str(caught.exception)
+        self.assertIn('--url', message)      # подсказка, как обойти проблему
+        self.assertNotIn('Traceback', message)
+
+    def test_fetch_chrome_dry_run_does_not_download(self):
+        fetch = self._fetch_chrome()
+        seen = []
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            with patch.object(fetch, 'download', lambda *a, **k: seen.append(a)):
+                code = fetch.main(['--dry-run', '--url', 'https://x/chrome-win64.zip',
+                                   '--dest', str(ROOT / 'browser')])
+        self.assertEqual(code, 0)
+        self.assertEqual(seen, [])
+        self.assertIn('https://x/chrome-win64.zip', buffer.getvalue())
+
+    def test_retry_gets_a_fresh_profile_directory(self):
+        # Профиль Chromium блокируется SingletonLock. Если повторный запуск идёт
+        # в тот же каталог, новый процесс передаёт URL «мёртвому» владельцу и
+        # сразу завершается — это и был «зависший chrome».
+        browser = native_browser.NativeBrowser(profile_dir=Path('C:/profile'))
+        self.assertEqual(browser.profile_dir, Path('C:/profile'))
+        self.assertEqual(browser.profile_for(1), Path('C:/profile-retry1'))
+        retry = native_browser.NativeBrowser(profile_dir=Path('C:/profile'), attempt=2)
+        self.assertEqual(retry.profile_dir, Path('C:/profile-retry2'))
+        # NativeHost обязан передавать номер попытки, иначе повтор бесполезен.
+        self.assertIn('attempt=self.attempt', (ROOT / 'main.py').read_text())
+
+    def test_every_module_level_name_is_bound(self):
+        # Регрессия: `class NativeHost(QObject)` падала с NameError на импорте,
+        # потому что QObject не был импортирован. Тесты на Linux не могут
+        # импортировать main.py (нет PyQt6), поэтому проверяем таблицу символов:
+        # любое имя, используемое на уровне модуля, должно быть определено.
+        modules = ['main.py', 'native_browser.py', 'win32_embed.py', 'browser_focus.py',
+                   'web_compat.py', 'qt_browser.py', 'speech_backend.py', 'diagnostics.py',
+                   'config.py', 'storage_paths.py', 'updater.py', 'crypto_utils.py',
+                   'hwid_gen.py', 'secure_store.py', 'win32_hotkeys.py', 'smoke_browser.py']
+        extra_globals = {'__file__', '__name__', '__doc__', '__package__', '__spec__',
+                         '__loader__', '__builtins__', '__debug__', '__path__'}
+        problems = []
+        for name in modules:
+            source = (ROOT / name).read_text()
+            table = symtable.symtable(source, name, 'exec')
+
+            def bound(sym):
+                return (sym.is_assigned() or sym.is_imported() or sym.is_namespace()
+                        or sym.is_parameter())
+
+            # только имена, которые модуль действительно связывает
+            # (импорты, def/class, присваивания) — referenced-only имён здесь нет
+            module_bound = ({sym.get_name() for sym in table.get_symbols() if bound(sym)}
+                            | extra_globals | set(dir(builtins)))
+
+            def walk(scope):
+                for sym in scope.get_symbols():
+                    # только имена, разрешаемые на уровне модуля: локальные,
+                    # параметры и замыкания связаны внутри своей области видимости
+                    if sym.is_global() and not bound(sym) and sym.get_name() not in module_bound:
+                        problems.append('%s: %s' % (name, sym.get_name()))
+                for child in scope.get_children():
+                    walk(child)
+
+            for sym in table.get_symbols():
+                if not bound(sym) and sym.get_name() not in module_bound:
+                    problems.append('%s: %s' % (name, sym.get_name()))
+            walk(table)
+        self.assertEqual(problems, [])
 
     def test_embed_is_checked_and_rolled_back(self):
         user32 = FakeUser32(parent_ok=False)

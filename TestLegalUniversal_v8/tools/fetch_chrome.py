@@ -41,10 +41,19 @@ def default_dest() -> Path:
     return here.parent / "browser"
 
 
+class FetchError(RuntimeError):
+    """Сеть/индекс недоступны: печатаем понятное сообщение, а не traceback."""
+
+
 def fetch_json(url: str, timeout: float = 30.0) -> dict:
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(url, timeout=timeout) as response:
-        return json.load(response)
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(url, timeout=timeout) as response:
+            return json.load(response)
+    except Exception as exc:
+        raise FetchError("Не удалось получить список версий (%s).\n"
+                         "Проверьте интернет/прокси/антивирус или укажите прямую "
+                         "ссылку: --url https://.../chrome-win64.zip" % exc) from exc
 
 
 def pick_url(index: dict, channel: str = "Stable", platform: str = "win64") -> tuple[str, str]:
@@ -61,9 +70,17 @@ def download(url: str, target: Path, report=print) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     report("Downloading %s" % url)
-    with opener.open(url, timeout=120) as response, open(target, "wb") as handle:
-        shutil.copyfileobj(response, handle, length=1024 * 256)
-    report("Saved %s (%.1f MB)" % (target, target.stat().st_size / 1048576.0))
+    try:
+        with opener.open(url, timeout=120) as response, open(target, "wb") as handle:
+            shutil.copyfileobj(response, handle, length=1024 * 256)
+    except Exception as exc:
+        raise FetchError("Загрузка прервана (%s).\nПопробуйте ещё раз или "
+                         "скачайте архив вручную и укажите --url." % exc) from exc
+    size = target.stat().st_size
+    if size < 5 * 1024 * 1024:
+        raise FetchError("Архив подозрительно маленький (%.1f MB) — похоже, это "
+                         "страница ошибки, а не Chrome." % (size / 1048576.0))
+    report("Saved %s (%.1f MB)" % (target, size / 1048576.0))
 
 
 def extract(archive: Path, dest: Path, report=print) -> Path:
@@ -102,6 +119,8 @@ def main(argv=None) -> int:
     parser.add_argument("--url", help="direct chrome-win64.zip URL (skips the index)")
     parser.add_argument("--dest", help="destination folder (default: <app>/browser)")
     parser.add_argument("--platform", default="win64")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="только показать, что будет скачано (без загрузки)")
     args = parser.parse_args(argv)
 
     dest = Path(args.dest) if args.dest else default_dest()
@@ -125,6 +144,10 @@ def main(argv=None) -> int:
             version, url = pick_url(index, args.channel, args.platform)
 
     print("Chrome for Testing %s -> %s" % (version or "(pinned url)", dest))
+    if args.dry_run:
+        print("URL: %s" % url)
+        print("Проверка без загрузки завершена.")
+        return 0
     tmp = Path(tempfile.mkdtemp(prefix="legalyze-chrome-"))
     archive = tmp / "chrome.zip"
     try:
@@ -139,4 +162,11 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except FetchError as error:
+        print("ОШИБКА: %s" % error, file=sys.stderr)
+        sys.exit(2)
+    except KeyboardInterrupt:
+        print("Отменено.", file=sys.stderr)
+        sys.exit(130)

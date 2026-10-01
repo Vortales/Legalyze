@@ -37,7 +37,8 @@ from PyQt6.QtWidgets import (
     QFormLayout, QMessageBox, QInputDialog, QGraphicsDropShadowEffect,
     QSizePolicy,
 )
-from PyQt6.QtCore import QTimer, QThread, pyqtSignal, Qt, QPoint, QRectF, QLockFile, pyqtSlot
+from PyQt6.QtCore import (QTimer, QThread, pyqtSignal, Qt, QPoint, QRectF, QLockFile, pyqtSlot,
+                          QObject)
 from PyQt6.QtGui import (
     QFont, QPainter, QColor, QPen, QBrush, QPainterPath, QKeySequence,
 )
@@ -343,7 +344,8 @@ MODIFIER_MAP = {
 from win32_hotkeys import HotkeyMonitor, HOTKEY_TOGGLE_ID, HOTKEY_MIC_ID
 from web_compat import JS_PURGE, JS_MIC_TOGGLE, JS_MIC_STOP, JS_MIC_START, CONSENT_CLICK_JS
 from native_browser import (NativeBrowser, discover_browsers, choose_target,
-                            apply_viewport, grant_microphone, speech_surface)
+                            apply_viewport, verify_viewport, grant_microphone,
+                            speech_surface)
 import win32_embed
 import browser_focus
 
@@ -2290,7 +2292,8 @@ class NativeHost(QObject):
         self.attempts += 1
         candidate = self.candidates[self.index]
         self.native = NativeBrowser(url=self.url, profile_dir=self.profile,
-                                    app_dir=self.app_dir, gpu=not self.gpu_off)
+                                    app_dir=self.app_dir, gpu=not self.gpu_off,
+                                    attempt=self.attempt)
         diag.event("browser.try", name=candidate.name, kind=candidate.kind,
                    attempt=self.attempts, gpu=not self.gpu_off)
         try:
@@ -3091,6 +3094,30 @@ class MainWindow(QMainWindow):
             except Exception:
                 diag.exception("main.sync_embedded")
 
+    def _ensure_viewport(self):
+        """Держать вьюпорт страницы закреплённым (защита от «широкого окна»).
+
+        `Emulation.setDeviceMetricsOverride` сбрасывается при смене таргета/
+        перезагрузке, после чего чат снова рисует desktop-раскладку с одним
+        словом «ИИ» по центру. Проверяем в фоновом потоке — GUI не блокируется.
+        """
+        if self._closing or not self.native_mode:
+            return
+        page = getattr(getattr(self, "worker", None), "page", None)
+        if page is None:
+            return
+
+        def guard():
+            try:
+                if verify_viewport(page, W, H):
+                    return
+                if apply_viewport(page, W, H):
+                    diag.event("browser.viewport_restored")
+            except Exception:
+                diag.exception("main.viewport_guard")
+
+        threading.Thread(target=guard, daemon=True).start()
+
     @stage
     def _register_hotkeys(self):
         try:
@@ -3514,6 +3541,12 @@ class MainWindow(QMainWindow):
         # Окно дочернего процесса подстраивается под плейсхолдер не сразу.
         QTimer.singleShot(500, self._sync_chrome_geometry)
         QTimer.singleShot(1500, self._sync_chrome_geometry)
+        # CSS-вьюпорт фиксируется намертво: если страница перезагрузилась или
+        # сменила таргет, метрики возвращаются к «широкой» раскладке — следим.
+        if getattr(self, "viewport_timer", None) is None:
+            self.viewport_timer = QTimer(self)
+            self.viewport_timer.timeout.connect(self._ensure_viewport)
+        self.viewport_timer.start(5000)
 
     @pyqtSlot(str)
     @stage
@@ -4082,6 +4115,8 @@ class MainWindow(QMainWindow):
         self.upload_deadline_timer.stop()
         self.response_end_timer.stop()
         self.topmost_timer.stop()
+        if getattr(self, "viewport_timer", None) is not None:
+            self.viewport_timer.stop()
         self.chrome_hwnd = None
 
         try:

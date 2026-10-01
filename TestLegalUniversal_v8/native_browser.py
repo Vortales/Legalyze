@@ -242,19 +242,31 @@ class NativeBrowser:
     window. Knows nothing about Qt."""
 
     def __init__(self, url=DEFAULT_URL, profile_dir=None, app_dir=None,
-                 report=None, gpu=None):
+                 report=None, gpu=None, attempt=0):
         self.url = url
         self.app_dir = Path(app_dir) if app_dir else Path.cwd()
         base = Path(profile_dir) if profile_dir else self.app_dir / "browser-profile"
         self.profile_base = Path(base)
-        self.profile_dir = self.profile_base
         self.report = report or diag.event
         self.port = None
         self.proc = None
         self.exe = None
         self.kind = "unknown"
-        self.attempt = 0
+        # `attempt` is the retry index owned by the caller (NativeHost). A retry
+        # MUST get a different profile directory: a Chromium profile is locked by
+        # a SingletonLock, and when a stale process still owns it a new launch
+        # hands the URL off to that dead process and exits immediately - which is
+        # exactly the "chrome hangs / never opens" report.
+        self.attempt = max(0, int(attempt or 0))
+        self.profile_dir = self.profile_for(self.attempt)
         self.gpu = (os.environ.get("LEGALYZE_DISABLE_GPU") != "1") if gpu is None else gpu
+
+    def profile_for(self, attempt):
+        """Profile directory used by retry `attempt` (0 = the main profile)."""
+        attempt = max(0, int(attempt or 0))
+        if attempt == 0:
+            return self.profile_base
+        return Path("%s-retry%d" % (self.profile_base, attempt))
 
     # -------------------------------------------------------------- lifecycle
     def _event(self, name, **data):
@@ -275,10 +287,7 @@ class NativeBrowser:
 
         self.exe = candidate.path
         self.kind = candidate.kind
-        self.attempt = 0 if self.exe != getattr(self, "_last_exe", None) else self.attempt + 1
-        self._last_exe = self.exe
-        self.profile_dir = self.profile_base if self.attempt == 0 else \
-            Path("%s-%d" % (self.profile_base, self.attempt))
+        self.profile_dir = self.profile_for(self.attempt)
         try:
             self.profile_dir.mkdir(parents=True, exist_ok=True)
         except Exception:
