@@ -1,0 +1,167 @@
+================================================================================
+ Legalyze 1.0.8 — Universal v14
+ КОРРЕКТНЫЙ СИНТАКСИС СБОРКИ NUITKA: ОДИН ЕДИНСТВЕННЫЙ EXE-ФАЙЛ (--onefile)
+================================================================================
+
+Файл создан отдельно по просьбе: здесь только рабочая команда, без вариантов.
+Скопировали строку — получили один исполняемый файл build\Legalyze.exe.
+
+
+--------------------------------------------------------------------------------
+1. ПОДГОТОВКА ОДИН РАЗ (Windows 10/11 x64)
+--------------------------------------------------------------------------------
+
+  а) Python 3.11 или 3.12, разрядность x64:
+         python --version
+         python -c "import struct; print(struct.calcsize('P')*8)"   -> 64
+
+  б) Microsoft Visual Studio Build Tools (обязательно для Nuitka):
+         winget install Microsoft.VisualStudio.2022.BuildTools --silent ^
+                --override "--wait --add Microsoft.VisualStudio.Workload.VCTools"
+      Достаточно рабочей нагрузки "Разработка классических приложений на C++"
+      (MSVC + Windows SDK). Полная Visual Studio не нужна.
+
+  в) Виртуальное окружение и зависимости — из папки TestLegalUniversal_v14:
+
+         cd /d C:\Projects\Legalyze\TestLegalUniversal_v14
+         python -m venv .venv
+         .venv\Scripts\python -m pip install --upgrade pip
+         .venv\Scripts\python -m pip install -r requirements-build.txt
+         .venv\Scripts\python -m pip install -r requirements.txt
+
+      Проверка, что всё на месте:
+
+         .venv\Scripts\python -c "import PyQt6, requests, websocket, cryptography, fpdf; print('ok')"
+         .venv\Scripts\python -m nuitka --version
+
+  г) Закреплённый браузер (рекомендуется, чтобы движок был одинаковым у всех):
+
+         tools\fetch_chrome.bat
+
+      Появится папка browser\chrome.exe рядом с main.py. В один файл она НЕ
+      упаковывается (это ~500 МБ и обновляется отдельно): exe ищет браузер
+      рядом с собой — <папка exe>\browser\chrome.exe, — а если его нет,
+      использует установленный Google Chrome или Edge.
+
+
+--------------------------------------------------------------------------------
+2. СБОРКА: ОДИН EXE (копировать целиком, это одна строка)
+--------------------------------------------------------------------------------
+
+.venv\Scripts\python -m nuitka --onefile --windows-console-mode=disable --enable-plugin=pyqt6 --include-package=requests --include-package=websocket --include-package=cryptography --include-package=fpdf --include-data-file=data/DejaVuSans.ttf=data/DejaVuSans.ttf --windows-icon-from-ico=icon.ico --assume-yes-for-downloads --output-dir=build --output-filename=Legalyze.exe main.py
+
+Результат:  build\Legalyze.exe   — ОДИН файл, больше ничего не нужно.
+
+То же самое делает build_onefile.bat: та же команда, но python в кавычках —
+чтобы работали пути с пробелами. Запускайте его из папки TestLegalUniversal_v14.
+
+Есть и build_nuitka.bat — он тоже собирает ОДИН файл (--onefile), но
+дополнительно кладёт внутрь лицензию шрифта и проставляет версию файла
+1.0.5.0. Флаги Nuitka в обеих командах одинаковые.
+
+
+--------------------------------------------------------------------------------
+3. ЧТО ОЗНАЧАЕТ КАЖДЫЙ КЛЮЧ
+--------------------------------------------------------------------------------
+
+  --onefile
+        Весь проект, все DLL и Qt превращаются в один exe. На старте Nuitka
+        распаковывает их во временную папку (обычно %TEMP%\ONEFILE_*), поэтому
+        первый запуск занимает 2-5 с — это нормально, так работает onefile.
+
+  --windows-console-mode=disable
+        GUI-приложение: чёрное окно консоли не появляется.
+
+  --enable-plugin=pyqt6
+        Плагин Qt: подтягивает Qt6, QtWebEngine, платформенные плагины,
+        ресурсы и переводы. Без него exe стартует и сразу падает.
+
+  --include-package=requests
+  --include-package=websocket
+  --include-package=cryptography
+  --include-package=fpdf
+        Пакеты, которые Nuitka не видит по импортам (загрузка и подгрузка
+        модулей в рантайме). Без них exe падает на обращении к серверу.
+
+  --include-data-file=data/DejaVuSans.ttf=data/DejaVuSans.ttf
+        Шрифт для PDF-экспорта. Формат: <откуда>=<куда внутри сборки>.
+
+  --windows-icon-from-ico=icon.ico
+        Иконка exe.
+
+  --assume-yes-for-downloads
+        Не задавать вопросов при докачке mingw/dependency walker.
+
+  --output-dir=build
+        Все артефакты — в папку build.
+
+  --output-filename=Legalyze.exe
+        Имя итогового файла.
+
+
+--------------------------------------------------------------------------------
+4. ПОСЛЕ КОМПИЛЯЦИИ (обязательно)
+--------------------------------------------------------------------------------
+
+  1) Проверить, что файл один:
+
+         dir build\Legalyze.exe
+
+  2) Положить exe туда, откуда он будет запускаться, и — если используете
+     закреплённый браузер — скопировать рядом папку browser:
+
+         <папка приложения>\
+             Legalyze.exe
+             browser\chrome.exe
+
+  3) Запустить с чистой машины (или из чистой папки профиля) и пройти
+     чек-лист раздела 7 README:
+
+         browser.discovered        — какой браузер найден
+         browser.embedded          — окно встроено
+         browser.zoom_prefs        — зум 67 % записан в профиль
+         browser.zoom source=...   — зум подтверждён ИЗМЕРЕНИЕМ
+         browser.target_chosen     — НЕ consent.google.com
+         browser.speech_surface    — sr=true и/или gum=true
+         mic.native_started -> mic.native_verify recording=True
+
+  4) Логи: %APPDATA%\Legalyze\logs\<сессия>\diagnostic.jsonl
+
+  5) Если антивирус ругается — это эвристика на onefile (распаковка в %TEMP%).
+     Лечится только подписью кода: подпишите exe своим сертификатом
+     (signtool sign /fd SHA256 /tr http://timestamp.digicert.com /a Legalyze.exe).
+     Обходных «магических» способов нет и обходиться без подписи честнее.
+
+
+--------------------------------------------------------------------------------
+5. ЕСЛИ НУЖНА ОТЛАДОЧНАЯ СБОРКА (папкой, а не одним файлом)
+--------------------------------------------------------------------------------
+
+.venv\Scripts\python -m nuitka --standalone --windows-console-mode=force --enable-plugin=pyqt6 --include-package=requests --include-package=websocket --include-package=cryptography --include-package=fpdf --include-data-file=data/DejaVuSans.ttf=data/DejaVuSans.ttf --windows-icon-from-ico=icon.ico --assume-yes-for-downloads --output-dir=build --output-filename=Legalyze.exe main.py
+
+Запуск:  build\main.dist\Legalyze.exe   (консоль включена — видны ошибки).
+
+Это НЕ тот файл, что нужен для релиза: релиз — одна строка из раздела 2.
+
+
+--------------------------------------------------------------------------------
+6. ЧАСТЫЕ ОШИБКИ
+--------------------------------------------------------------------------------
+
+  "The C compiler 'cl.exe' ..."
+        Не установлены Build Tools (п. 1б) или не x64-окружение.
+        Запускайте сборку из "x64 Native Tools Command Prompt for VS".
+
+  "ModuleNotFoundError: PyQt6" при сборке
+        Команда запущена системным python, а не из .venv.
+        Всегда: .venv\Scripts\python -m nuitka ...
+
+  exe стартует и сразу закрывается
+        Соберите отладочный вариант (раздел 5) — в консоли будет текст ошибки.
+
+  Нет модуля websocket / cryptography в exe
+        Пропущен --include-package=... — берите команду из раздела 2 целиком.
+
+  Долгий старт (несколько секунд)
+        Это природа --onefile (распаковка). Ускоряется только переходом на
+        --standalone (папка), но тогда файлов много.
