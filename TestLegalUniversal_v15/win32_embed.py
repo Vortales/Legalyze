@@ -59,6 +59,7 @@ WS_EX_APPWINDOW = 0x00040000
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_NOACTIVATE = 0x08000000
 SW_HIDE = 0
+WM_CLOSE = 0x0010
 SW_SHOW = 5
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
@@ -157,6 +158,8 @@ def configure(user32):
         ("GetFocus", [], wintypes.HWND),
         ("GetForegroundWindow", [], wintypes.HWND),
         ("IsChild", [wintypes.HWND, wintypes.HWND], wintypes.BOOL),
+        ("PostMessageW", [wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                          wintypes.LPARAM], wintypes.BOOL),
         ("GetAncestor", [wintypes.HWND, wintypes.UINT], wintypes.HWND),
     ):
         try:
@@ -244,7 +247,9 @@ def _windows_of(user32, pids):
             if pid.value not in pids:
                 return True
             name = class_name(user32, hwnd)
-            if name not in (BROWSER_WINDOW_CLASS, "Chrome_WidgetWin_0"):
+            # Шире, чем одна константа: Chrome поднимает Chrome_WidgetWin_0/1/2,
+            # и именно «двойка» оставалась висеть в Alt+Tab.
+            if not (name == BROWSER_WINDOW_CLASS or name.startswith("Chrome_WidgetWin")):
                 return True
             info = snapshot(user32, hwnd)
             info["class"] = name
@@ -647,15 +652,32 @@ def hide_from_taskbar(user32, hwnd):
     return bool(styled or deleted)
 
 
-def hide_stray_windows(user32, pids, keep=0):
+def hide_window(user32, hwnd):
+    """Скрыть окно целиком: не видно ни на экране, ни в Alt+Tab."""
+    if not user32 or not hwnd:
+        return False
+    try:
+        return bool(user32.ShowWindow(wintypes.HWND(int(hwnd)), SW_HIDE))
+    except Exception:
+        diag.exception("win32_embed.hide_window")
+        return False
+
+
+def hide_stray_windows(user32, pids, keep=0, close_after_hide=False):
     """Скрыть ВСЕ окна дерева браузера, кроме встроенного (`keep`).
 
-    Chrome поднимает вспомогательные поверхности, и именно они копятся в
-    панели задач после повторов запуска. Встроенное окно не трогаем.
+    Chrome поднимает вспомогательные поверхности, и именно они копятся в панели
+    задач и в Alt+Tab после повторов запуска. Встроенное окно не трогаем.
+
+    Сначала окно скрывается (пользователь не видит его нигде и сразу), и
+    только если это настоящее лишнее окно приложения — ему посылается
+    WM_CLOSE. Служебные окна Chrome (`Chrome_WidgetWin_0`) закрывать нельзя:
+    это опорное окно браузера, закрытие убивает весь процесс.
     """
     if not user32:
         return []
     hidden = []
+    closed = []
     for info in windows_of(user32, pids):
         hwnd = int(info.get("hwnd") or 0)
         if not hwnd or hwnd == int(keep or 0) or not info.get("visible"):
@@ -667,6 +689,13 @@ def hide_stray_windows(user32, pids, keep=0):
             continue
         hide_from_taskbar(user32, hwnd)
         hidden.append(hwnd)
+        if close_after_hide and info.get("class") == BROWSER_WINDOW_CLASS:
+            try:
+                if user32.PostMessageW(wintypes.HWND(hwnd), WM_CLOSE, 0, 0):
+                    closed.append(hwnd)
+            except Exception:
+                diag.exception("win32_embed.close_stray")
     if hidden:
-        diag.event("win32.stray_hidden", hidden=hidden, keep=int(keep or 0))
+        diag.event("win32.stray_hidden", hidden=hidden, closed=closed,
+                   keep=int(keep or 0))
     return hidden

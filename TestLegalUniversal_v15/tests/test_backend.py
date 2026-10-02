@@ -140,6 +140,7 @@ class FakeUser32:
         self.parent_ok = parent_ok
         self.moves = []
         self.hidden = []
+        self.closed = []
 
     def GetWindowLongPtrW(self, hwnd, index):
         return self.exstyle0 if index == win32_embed.GWL_EXSTYLE else self.style0
@@ -187,6 +188,11 @@ class FakeUser32:
     def SetWindowPos(self, hwnd, after, x, y, w, h, flags):
         self.moves.append((_as_int(x), _as_int(y), _as_int(w), _as_int(h),
                            _as_int(flags)))
+        return True
+
+    def PostMessageW(self, hwnd, msg, wparam, lparam):
+        if _as_int(msg) == win32_embed.WM_CLOSE:
+            self.closed.append(_as_int(hwnd))
         return True
 
     def GetWindowThreadProcessId(self, hwnd, pid):
@@ -965,7 +971,7 @@ class BrowserWindowTests(unittest.TestCase):
     def test_the_shift_is_baked_in_as_constants(self):
         source = (ROOT / 'main.py').read_text()
         self.assertIn('BROWSER_DX = -10', source)
-        self.assertIn('BROWSER_DY = -20', source)
+        self.assertIn('BROWSER_DY = -40', source)
         # ...и реально передаётся окну браузера, а не лежит мёртвым грузом.
         self.assertIn('host.inset = self._browser_inset()', source)
         for name in ('_browser_inset', '_hide_browser_taskbar'):
@@ -1098,6 +1104,202 @@ class BrowserWindowTests(unittest.TestCase):
         self.assertNotIn('HOTKEY_ADMIN_ID', source)
         self.assertNotIn('AdminPanel', source)
         self.assertNotIn('admin_mode', source)
+
+
+def bind_methods(owner, names, extra_scope=()):
+    """Связать методы MainWindow с заглушкой: PyQt6 на Linux недоступен."""
+    source = (ROOT / 'main.py').read_text()
+    tree = ast.parse(source)
+    window = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                  and n.name == 'MainWindow')
+    nodes = {n.name: n for n in window.body if isinstance(n, ast.FunctionDef)}
+    for name in names:
+        node = nodes[name]
+        body = list(node.body)
+        if isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+            body = body[1:]
+        clone = ast.FunctionDef(name=name, args=node.args, body=body,
+                                decorator_list=[], returns=None,
+                                type_comment=None, type_params=[])
+        ast.fix_missing_locations(clone)
+        scope = {'int': int, 'float': float, 'round': round, 'max': max,
+                 'abs': abs, 'PAGE_ZOOM': 2.0 / 3.0, 'WIDTH_DELTA': 0,
+                 'HEIGHT_DELTA': 0}
+        scope.update(dict(extra_scope))
+        exec(compile(ast.Module(body=[clone], type_ignores=[]),
+                     '<%s>' % name, 'exec'), scope)
+        setattr(owner, name, scope[name].__get__(owner))
+
+
+class PlacementSettingsTests(unittest.TestCase):
+    """Блок настроек, от которого считается положение объектов.
+
+    Числа с Windows (замер pre14): плейсхолдер 453x735 DIP, а клиентская
+    область САМОГО окна браузера — 439x728. Если цель раскладки считать от
+    плейсхолдера, получается dsf 439/679 = 0.6465 вместо 439/658 = 0.6672 —
+    страница на 3 % мельче. Именно поэтому v15 отличался от pre14.
+    """
+
+    PLACEHOLDER = (453, 735)
+    BROWSER = (439, 728)      # замерено на Windows в pre14
+
+    def _owner(self, scale=1.0, **scope):
+        owner = SimpleNamespace()
+        owner._placeholder_logical_size = lambda: self.PLACEHOLDER
+        owner._placeholder_physical_size = lambda: tuple(
+            int(round(v * scale)) for v in self.PLACEHOLDER)
+        owner._browser_physical_size = lambda: self.BROWSER
+        owner._monitor_scale = lambda: scale
+        base = {'BROWSER_DX': -10, 'BROWSER_DY': -40,
+                'BROWSER_DW': 0, 'BROWSER_DH': 0}
+        base.update(scope)
+        bind_methods(owner, ('_browser_logical_size', '_zoom_size', '_zoom_args',
+                             '_browser_inset'), sorted(base.items()))
+        owner.cfg = {}
+        return owner
+
+    def test_all_settings_live_in_one_marked_block(self):
+        source = (ROOT / 'main.py').read_text()
+        names = ('BROWSER_DX', 'BROWSER_DY', 'BROWSER_DW', 'BROWSER_DH',
+                 'PAGE_ZOOM', 'WIDTH_DELTA', 'HEIGHT_DELTA', 'PAGE_OFFSET_X',
+                 'PAGE_OFFSET_Y', 'PAD_BOTTOM', 'SCROLL_X', 'SCROLL_Y',
+                 'INPUT_DX', 'INPUT_DY', 'INPUT_SELECTOR', 'CLOSE_STRAY_WINDOWS')
+        start = source.index('НАСТРОЙКИ РАСПОЛОЖЕНИЯ ОБЪЕКТОВ')
+        end = source.index('конец блока настроек')
+        block = source[start:end]
+        for name in names:
+            self.assertIn(name + ' =', block, name)
+            # И ни одного определения вне блока.
+            self.assertEqual(source.count('\n' + name + ' ='), 1, name)
+
+    def test_the_zoom_target_uses_the_browser_window_not_the_placeholder(self):
+        owner = self._owner()
+        self.assertEqual(owner._browser_logical_size(), self.BROWSER)
+        self.assertEqual(owner._zoom_size(), self.BROWSER + self.BROWSER)
+        # Цель обязана совпасть с замером pre14: css 658x1091, dsf 0.6672.
+        css_w, css_h, dsf = self._target_of(owner)
+        self.assertEqual(css_w, 658)
+        self.assertEqual(css_h, 1091)
+        self.assertAlmostEqual(dsf, 0.6672, places=4)
+        # От плейсхолдера получалось бы css 679 / dsf 0.6465 — на 3 % мельче.
+        self.assertNotEqual(css_w, int(round(self.PLACEHOLDER[0] / (2.0 / 3.0))))
+
+    def test_the_target_scales_with_the_monitor(self):
+        # При 150 % окно браузера физически больше, но в DIP — то же самое,
+        # поэтому css остаётся прежним, а dsf растёт.
+        owner = self._owner(scale=1.5)
+        owner._browser_physical_size = lambda: (659, 1092)
+        css_w, css_h, dsf = self._target_of(owner)
+        self.assertEqual(owner._browser_logical_size(), (439, 728))
+        self.assertEqual(css_w, 658)
+        self.assertAlmostEqual(dsf, 659 / 658.0, places=3)
+
+    def test_the_layout_deltas_from_the_settings_block_are_honoured(self):
+        owner = self._owner(WIDTH_DELTA=-6, HEIGHT_DELTA=-20)
+        css_w, css_h, dsf = self._target_of(owner)
+        self.assertEqual(css_w, 652)
+        # dsf пересчитывается от новой ширины, css_h — от нового dsf.
+        self.assertAlmostEqual(dsf, 439 / 652.0, places=4)
+        self.assertEqual(css_h, int(round(728 / dsf)) - 20)
+
+    def test_the_page_zoom_from_the_settings_block_is_honoured(self):
+        owner = self._owner(PAGE_ZOOM=0.5)
+        css_w, _css_h, dsf = self._target_of(owner, zoom=0.5)
+        self.assertEqual(css_w, 878)          # 439 / 0.5
+        self.assertAlmostEqual(dsf, 439 / 878.0, places=4)
+
+    def test_the_window_size_knobs_are_applied(self):
+        owner = self._owner()
+        self.assertEqual(owner._browser_inset(), (-10, -40, 10, 40))
+        # BROWSER_DW/DH урезают окно: правый/нижний inset перестаёт быть
+        # зеркальным, а левый/верхний остаётся сдвигом.
+        owner.cfg = {'browser_dw': -20, 'browser_dh': -30}
+        self.assertEqual(owner._browser_inset(), (-10, -40, 30, 70))
+
+    def test_the_guard_passes_the_configured_zoom(self):
+        source = (ROOT / 'main.py').read_text()
+        guard = source.split('def _ensure_zoom(', 1)[1].split('\n    def ', 1)[0]
+        self.assertIn('self._zoom_args()', guard)
+        self.assertIn('zoom=PAGE_ZOOM', guard)
+        # Сдвиги страницы внедряются тем же сторожем (после перезагрузки
+        # стиль пропадает, поэтому он проверяется каждый проход).
+        self.assertIn('page.eval(page_tune_js(with_scroll=False)', guard)
+
+    def test_the_page_tuning_is_off_when_all_values_are_zero(self):
+        # v13-поведение: пока сдвиги нулевые, страницу не трогаем вообще.
+        source = (ROOT / 'main.py').read_text()
+        self.assertIn('def page_tuning_needed():', source)
+        self.assertIn('!offX && !offY && !padB && !inX && !inY', source)
+        self.assertIn('if page_tuning_needed():', source)
+
+    def _target_of(self, owner, zoom=None):
+        zoom = (2.0 / 3.0) if zoom is None else zoom
+        logical_w, _lh, physical_w, physical_h = owner._zoom_args()
+        css_w = max(320, int(round(logical_w / zoom)))
+        dsf = (float(physical_w) / css_w) if css_w else 1.0
+        return css_w, int(round(physical_h / dsf)), dsf
+
+
+class StrayWindowTests(unittest.TestCase):
+    """Окна браузера: не появляться ни в панели задач, ни в Alt+Tab."""
+
+    def test_a_stray_app_window_is_closed_not_only_hidden(self):
+        user32 = FakeUser32()
+        windows = [{'hwnd': 11, 'class': 'Chrome_WidgetWin_1', 'visible': True},
+                   {'hwnd': 22, 'class': 'Chrome_WidgetWin_1', 'visible': True}]
+        with patch.object(win32_embed, '_windows_of', return_value=windows), \
+             patch.object(win32_embed, 'taskbar_delete_tab', return_value=True):
+            win32_embed.hide_stray_windows(user32, [5], keep=22,
+                                           close_after_hide=True)
+        # Сначала скрыто, потом закрыто — пользователь не видит ни переключения.
+        self.assertEqual([h for h, _c in user32.hidden], [11])
+        self.assertEqual(_as_int(user32.hidden[0][1]), win32_embed.SW_HIDE)
+        self.assertEqual(user32.closed, [11])
+
+    def test_a_service_window_is_hidden_but_never_closed(self):
+        # Chrome_WidgetWin_0 — опорное окно браузера: закрытие убивает процесс.
+        user32 = FakeUser32()
+        windows = [{'hwnd': 11, 'class': 'Chrome_WidgetWin_0', 'visible': True}]
+        with patch.object(win32_embed, '_windows_of', return_value=windows), \
+             patch.object(win32_embed, 'taskbar_delete_tab', return_value=True):
+            win32_embed.hide_stray_windows(user32, [5], keep=22,
+                                           close_after_hide=True)
+        self.assertEqual(user32.hidden, [(11, win32_embed.SW_HIDE)])
+        self.assertEqual(user32.closed, [])
+
+    def test_the_whole_widgetwin_family_is_covered(self):
+        # Только Chrome_WidgetWin_0/1 пропускали «двойку» в Alt+Tab.
+        source = (ROOT / 'win32_embed.py').read_text()
+        self.assertIn('name.startswith("Chrome_WidgetWin")', source)
+
+    def test_the_found_window_is_hidden_before_embedding(self):
+        source = (ROOT / 'main.py').read_text()
+        embed = source.split('def _embed(', 1)[1].split('\n    def ', 1)[0]
+        self.assertIn('win32_embed.hide_window(self.user32, hwnd)', embed)
+        self.assertLess(embed.index('hide_window'),
+                        embed.index('win32_embed.embed('))
+
+    def test_the_pid_tree_is_refreshed_after_ready(self):
+        # После ready таймер останавливается, и pids застывали — окна всплывших
+        # позже процессов оставались висеть.
+        source = (ROOT / 'main.py').read_text()
+        self.assertIn('def refresh_pids(self):', source)
+        self.assertIn('descendant_pids(root)', source)
+        host_src = source[source.index('class NativeHost'):]
+        for name in ('hide_taskbar', '_kill_all', '_tick'):
+            block = host_src.split('def %s(' % name, 1)[1].split('\n    def ', 1)[0]
+            self.assertIn('refresh_pids', block, name)
+
+    def test_the_hiding_is_dense_in_the_first_seconds(self):
+        source = (ROOT / 'main.py').read_text()
+        self.assertIn('(300, 800, 1500, 2500, 4000)', source)
+        self.assertIn('CLOSE_STRAY_WINDOWS', source)
+
+    def test_hide_window_uses_sw_hide(self):
+        user32 = FakeUser32()
+        self.assertTrue(win32_embed.hide_window(user32, 77))
+        self.assertEqual(user32.hidden, [(77, win32_embed.SW_HIDE)])
+        self.assertFalse(win32_embed.hide_window(None, 77))
 
 
 class SpeechBackendTests(unittest.TestCase):
@@ -1374,6 +1576,68 @@ class JavascriptTests(unittest.TestCase):
         res = subprocess.run([NODE, '-e', script], capture_output=True, text=True, timeout=60)
         if res.returncode != 0:
             self.fail('node failed: ' + res.stderr[-2000:])
+
+    def _tune_js(self, **values):
+        """PAGE_TUNE_JS со значениями из блока настроек (как page_tune_js())."""
+        template = literal('PAGE_TUNE_JS', 'main.py')
+        sx = int(values.get('SCROLL_X', 0))
+        sy = int(values.get('SCROLL_Y', 0))
+        return template % (int(values.get('PAGE_OFFSET_X', 0)),
+                           int(values.get('PAGE_OFFSET_Y', 0)),
+                           int(values.get('PAD_BOTTOM', 0)),
+                           int(values.get('INPUT_DX', 0)),
+                           int(values.get('INPUT_DY', 0)),
+                           json.dumps(str(values.get('INPUT_SELECTOR', 'textarea'))),
+                           sx, sy, sx, sy)
+
+    def _run_tune(self, **values):
+        script = r"""
+var store = {};
+var head = { appendChild: function (n) { store[n.id] = n; n.parentNode = head; } };
+var document = {
+  getElementById: function (id) { return store[id] || null; },
+  createElement: function (tag) { return { id: '', textContent: '', parentNode: null }; },
+  head: head, documentElement: {}
+};
+var scrolled = null;
+var window = { scrollTo: function (x, y) { scrolled = [x, y]; } };
+var out = __TUNE_JS__;
+var node = store['legalyze-tune-css'] || null;
+console.log(JSON.stringify({ out: out, css: node ? node.textContent : null,
+                             present: !!node, scrolled: scrolled }));
+""".replace('__TUNE_JS__', self._tune_js(**values))
+        res = subprocess.run([NODE, '-e', script], capture_output=True,
+                             text=True, timeout=60)
+        if res.returncode != 0:
+            self.fail('node failed: ' + res.stderr[-2000:])
+        return json.loads(res.stdout.strip().splitlines()[-1])
+
+    def test_page_tune_is_a_noop_when_every_value_is_zero(self):
+        # Пока сдвиги нулевые, страница обязана остаться ровно v13: ни стиля,
+        # ни прокрутки, ни единой правки DOM.
+        state = self._run_tune()
+        self.assertTrue(state['out']['ok'])
+        self.assertTrue(state['out'].get('removed'))
+        self.assertFalse(state['present'])
+        self.assertIsNone(state['scrolled'])
+
+    def test_page_tune_writes_the_shifts_and_scrolls(self):
+        state = self._run_tune(PAGE_OFFSET_Y=-24, PAD_BOTTOM=18,
+                               INPUT_DX=3, INPUT_DY=-7, SCROLL_Y=120,
+                               INPUT_SELECTOR='textarea')
+        css = state['css'] or ''
+        self.assertIn('translate(0px, -24px)', css)
+        self.assertIn('padding-bottom: 18px', css)
+        self.assertIn('textarea { transform: translate(3px, -7px)', css)
+        self.assertEqual(state['scrolled'], [0, 120])
+
+    def test_page_tune_without_scroll_does_not_fight_the_user(self):
+        # Повторное применение (сторож зума) не должно прокручивать страницу.
+        template = literal('PAGE_TUNE_JS', 'main.py')
+        js = template % (0, -24, 0, 0, 0, json.dumps('textarea'), 0, 0, 0, 0)
+        self.assertIn('if (0 || 0)', js)
+        state = self._run_tune(PAGE_OFFSET_Y=-24, SCROLL_Y=120)
+        self.assertIsNotNone(state['scrolled'])
 
     def test_ready_script_gate(self):
         script = literal('READY_SCRIPT', 'qt_browser.py')

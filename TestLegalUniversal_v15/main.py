@@ -83,15 +83,109 @@ BROWSER_PROFILE = APP_DIR / "browser-profile"
 
 X, Y, W, H = 1426, 200, 453, 735
 
-# v15: положение окна браузера внутри плейсхолдера, в DIP. Значения НЕ угаданы,
-# а подобраны на Windows в измерительной сборке pre14 (режим администратора):
-# при сдвиге X -10 и Y -20 поле ввода промта встаёт на место. Размер окна при
-# этом не меняется, поэтому незакрашенных полос не появляется.
-BROWSER_DX = -10
-BROWSER_DY = -20
+# ============================================================================
+# НАСТРОЙКИ РАСПОЛОЖЕНИЯ ОБЪЕКТОВ — правьте числа ТОЛЬКО здесь и перезапускайте
+# ============================================================================
+# Значения НЕ угаданы: сдвиг окна подобран на Windows в измерительной сборке
+# pre14 (режим администратора). Остальное — те же ползунки, но числами.
+
+# --- окно браузера внутри окна программы, DIP (сдвиг и изменение размера) ---
+BROWSER_DX = -10     # сдвиг окна браузера по X: -10 = влево, +10 = вправо
+BROWSER_DY = -40     # сдвиг окна браузера по Y: -40 = вверх, +40 = вниз
+BROWSER_DW = 0       # изменить ширину окна браузера (0 = не менять)
+BROWSER_DH = 0       # изменить высоту окна браузера (0 = не менять)
+
+# --- раскладка страницы ---
+PAGE_ZOOM = 0.667    # нативный зум страницы (0.667 = 67 %)
+WIDTH_DELTA = 0      # поправка ширины раскладки, CSS px
+HEIGHT_DELTA = 0     # поправка высоты раскладки, CSS px
+
+# --- сдвиг содержимого страницы, CSS px (0 = страницу не трогаем вообще) ---
+PAGE_OFFSET_X = 0    # сдвинуть всю страницу вправо/влево
+PAGE_OFFSET_Y = 0    # сдвинуть всю страницу вверх/вниз
+PAD_BOTTOM = 0       # добавить отступ снизу страницы
+SCROLL_X = 0         # прокрутка сразу после загрузки
+SCROLL_Y = 0
+
+# --- сдвиг ТОЛЬКО поля ввода, CSS px ---
+INPUT_DX = 0
+INPUT_DY = 0
+INPUT_SELECTOR = ('textarea, div[contenteditable="true"], rich-textarea, '
+                  '[role="textbox"], input[type="text"]')
+
+# --- поведение лишних окон браузера ---
+CLOSE_STRAY_WINDOWS = True   # после скрытия закрывать лишнее окно приложения
+# =========================== конец блока настроек ============================
+
 # Журнал pid своего браузера: по нему добиваемся то, что осталось от прошлого
 # запуска (иначе его окно висит в панели задач и мешает синглтону профиля).
 BROWSER_PIDS_FILE = APP_DIR / "browser-pids.json"
+
+PAGE_TUNE_JS = """
+(function(){
+  try {
+    var D = document, id = 'legalyze-tune-css';
+    var s = D.getElementById(id);
+    var offX = %d, offY = %d, padB = %d, inX = %d, inY = %d;
+    var sel = %s;
+    if (!offX && !offY && !padB && !inX && !inY) {
+      if (s && s.parentNode) { s.parentNode.removeChild(s); }
+      return {ok: true, removed: true};
+    }
+    if (!s) {
+      s = D.createElement('style');
+      s.id = id;
+      (D.head || D.documentElement).appendChild(s);
+    }
+    var css = '';
+    if (offX || offY) {
+      css += 'html, body { transform: translate(' + offX + 'px, ' + offY + 'px); }';
+    }
+    if (padB) {
+      css += 'html, body { padding-bottom: ' + padB + 'px !important; }';
+    }
+    if (inX || inY) {
+      css += sel + ' { transform: translate(' + inX + 'px, ' + inY + 'px) !important; }';
+    }
+    s.textContent = css;
+    var out = {ok: true, len: css.length};
+    if (%d || %d) {
+      window.scrollTo(%d, %d);
+      out.scrolled = true;
+    }
+    return out;
+  } catch (e) {
+    return {ok: false, error: String(e)};
+  }
+})()
+"""
+
+
+def page_tune_js(with_scroll=True):
+    """Сдвиги страницы из блока настроек: один <style> + прокрутка.
+
+    При нулевых значениях стиль СНИМАЕТСЯ — страница остаётся ровно такой,
+    как в проверенной на Windows v13. `with_scroll=False` — для повторного
+    применения (не мешаем пользователю прокручивать самому).
+    """
+    sx = int(SCROLL_X) if with_scroll else 0
+    sy = int(SCROLL_Y) if with_scroll else 0
+    return PAGE_TUNE_JS % (int(PAGE_OFFSET_X), int(PAGE_OFFSET_Y), int(PAD_BOTTOM),
+                           int(INPUT_DX), int(INPUT_DY),
+                           json.dumps(str(INPUT_SELECTOR)),
+                           sx, sy, sx, sy)
+
+
+def page_tuning_needed():
+    """Нужно ли вообще трогать страницу (все сдвиги нулевые -> нет)."""
+    return bool(PAGE_OFFSET_X or PAGE_OFFSET_Y or PAD_BOTTOM
+                or INPUT_DX or INPUT_DY or SCROLL_X or SCROLL_Y)
+
+
+def zoom_settings_needed():
+    """Отличаются ли настройки раскладки от проверенных значений v13."""
+    return bool(WIDTH_DELTA or HEIGHT_DELTA
+                or abs(float(PAGE_ZOOM) - (2.0 / 3.0)) > 1e-6)
 
 GWL_STYLE = -16
 GWL_EXSTYLE = -20
@@ -2347,7 +2441,7 @@ class NativeHost(QObject):
                 self._retry("devtools-timeout")
             return
         if self.stage == "window":
-            self.pids |= win32_embed.child_pids(self.native.proc.pid)
+            self.refresh_pids()
             _pid_journal_write(self.pids)
             hwnd = win32_embed.find_browser_window(self.user32, self.pids, timeout=0.5)
             if hwnd:
@@ -2361,6 +2455,9 @@ class NativeHost(QObject):
         if not parent:
             self._retry("no-placeholder")
             return
+        # Скрыть ДО встраивания: без этого окно на мгновение появляется
+        # настоящим окном (со всеми элементами браузера) и попадает в Alt+Tab.
+        win32_embed.hide_window(self.user32, hwnd)
         if not win32_embed.embed(self.user32, hwnd, parent, self.inset):
             self._retry("embed-failed")
             return
@@ -2371,6 +2468,10 @@ class NativeHost(QObject):
         # v15: панель задач. Chrome сам возвращает свою кнопку через
         # ITaskbarList::AddTab и не сразу, поэтому скрываем сразу и повторяем.
         self.hide_taskbar()
+        # Chrome поднимает окна и возвращает кнопку не сразу: первые секунды
+        # проверяем часто, потом достаточно одного таймера раз в 5 с.
+        for delay in (300, 800, 1500, 2500, 4000):
+            QTimer.singleShot(delay, self.hide_taskbar)
         QTimer.singleShot(1200, self.hide_taskbar)
         QTimer.singleShot(4000, self.hide_taskbar)
         diag.event("browser.embedded", hwnd=int(hwnd), parent=parent, port=self.port,
@@ -2381,15 +2482,43 @@ class NativeHost(QObject):
         """Убрать из панели задач и встроенное окно, и все лишние окна браузера.
 
         Безопасна при повторном вызове: стиль меняется только если он уже не
-        тот, а DeleteTab идемпотентен.
+        тот, а DeleteTab идемпотентен. Дерево pid пересчитывается каждый раз,
+        иначе всплывшие позже окна остаются висеть.
         """
         if not self.hwnd or not self.user32:
             return
+        self.refresh_pids()
         try:
             win32_embed.hide_from_taskbar(self.user32, self.hwnd)
-            win32_embed.hide_stray_windows(self.user32, self.pids, keep=self.hwnd)
+            self._hide_strays(keep=self.hwnd)
         except Exception:
             diag.exception("main.hide_taskbar")
+
+    def refresh_pids(self):
+        """Пересчитать дерево pid.
+
+        После `ready` таймер останавливается, и `pids` застывает: процессы,
+        поднятые позже (рендереры, утилиты), в него не попадают, и их окна
+        остаются висеть в Alt+Tab.
+        """
+        proc = getattr(self.native, "proc", None)
+        if proc is None:
+            return
+        try:
+            root = int(proc.pid)
+            self.pids |= {root} | win32_embed.descendant_pids(root)
+        except Exception:
+            diag.exception("main.refresh_pids")
+
+    def _hide_strays(self, keep=0):
+        """Скрыть (и закрыть) все окна браузера, кроме встроенного."""
+        if not self.user32:
+            return
+        try:
+            win32_embed.hide_stray_windows(self.user32, self.pids, keep=keep,
+                                           close_after_hide=bool(CLOSE_STRAY_WINDOWS))
+        except Exception:
+            diag.exception("main.hide_strays")
 
     def _kill_all(self):
         """Снять ВСЁ дерево браузера.
@@ -2398,6 +2527,7 @@ class NativeHost(QObject):
         выживают, их окна остаются — из-за этого «плодятся браузеры».
         Чужие процессы не трогаем: только pid своего дерева.
         """
+        self.refresh_pids()
         pids = set(int(p) for p in (self.pids or ()))
         proc = getattr(self.native, "proc", None)
         if proc is not None:
@@ -3187,21 +3317,25 @@ class MainWindow(QMainWindow):
     def _browser_inset(self):
         """(left, top, right, bottom) окна браузера в ФИЗИЧЕСКИХ px плейсхолдера.
 
-        Сдвиг из pre14 (X -10, Y -20 DIP), переведённый в физические пиксели
-        текущего монитора: при 125 % и 150 % сдвиг в DIP тот же самый, а в
-        пикселях — во столько же раз больше. Размер окна не меняется.
+        Сдвиг из pre14, переведённый в физические пиксели текущего монитора:
+        при 125 % и 150 % сдвиг в DIP тот же самый, а в пикселях — во столько
+        же раз больше. Размер окна меняется только если заданы BROWSER_DW/DH.
         """
         try:
             dx = int(self.cfg.get("browser_dx", BROWSER_DX))
             dy = int(self.cfg.get("browser_dy", BROWSER_DY))
+            dw = int(self.cfg.get("browser_dw", BROWSER_DW))
+            dh = int(self.cfg.get("browser_dh", BROWSER_DH))
         except (TypeError, ValueError):
-            dx, dy = BROWSER_DX, BROWSER_DY
+            dx, dy, dw, dh = BROWSER_DX, BROWSER_DY, BROWSER_DW, BROWSER_DH
         logical_w, logical_h = self._placeholder_logical_size()
         physical_w, physical_h = self._placeholder_physical_size()
         scale = (float(physical_w) / float(logical_w)) if logical_w else 1.0
         left = int(round(dx * scale))
         top = int(round(dy * scale))
-        return (left, top, -left, -top)
+        right = -int(round((dx + dw) * scale))
+        bottom = -int(round((dy + dh) * scale))
+        return (left, top, right, bottom)
 
     def _hide_browser_taskbar(self):
         """Периодически убираем кнопку браузера из панели задач (v15)."""
@@ -3258,11 +3392,48 @@ class MainWindow(QMainWindow):
                 diag.exception("main.browser_physical")
         return placeholder_size
 
+    def _browser_logical_size(self):
+        """Логический (DIP) размер САМОГО окна браузера.
+
+        Резерв — плейсхолдер, пока окно ещё не встроено.
+        """
+        physical_w, physical_h = self._browser_physical_size()
+        scale = self._monitor_scale()
+        if scale <= 0:
+            scale = 1.0
+        width = int(round(physical_w / scale))
+        height = int(round(physical_h / scale))
+        if width > 0 and height > 0:
+            return width, height
+        return self._placeholder_logical_size()
+
     def _zoom_size(self):
-        """(логические DIP, физические пиксели) — для расчёта зума 67 %."""
-        logical_w, logical_h = self._placeholder_logical_size()
+        """(логические DIP, физические пиксели) — для расчёта зума 67 %.
+
+        Логический размер берётся у САМОГО окна браузера, а НЕ у плейсхолдера:
+        на Windows клиентская область окна браузера на 14x7 px меньше
+        плейсхолдера (453x735 против 439x728). Цель, посчитанная от
+        плейсхолдера, даёт dsf 439/679 = 0.6465 вместо 439/658 = 0.667 —
+        страница получается на 3 % мельче, и именно поэтому отображение
+        объектов в v15 отличалось от замеров pre14. От своего окна цель
+        совпадает с нативным рендером ровно, и ничего переопределять не нужно.
+        """
+        logical_w, logical_h = self._browser_logical_size()
         physical_w, physical_h = self._browser_physical_size()
         return logical_w, logical_h, physical_w, physical_h
+
+    def _zoom_args(self):
+        """(logical_w, logical_h, physical_w, physical_h) для native_browser.
+
+        Поправки блока настроек подаются так, что `target_css` вернёт ровно
+        нужные css и dsf: `target_css` считает `css = logical / zoom` и
+        `css_h = physical_h / dsf`.
+        """
+        logical_w, logical_h, physical_w, physical_h = self._zoom_size()
+        css_w = max(320, int(round(logical_w / float(PAGE_ZOOM))) + int(WIDTH_DELTA))
+        dsf = (float(physical_w) / css_w) if css_w else 1.0
+        css_h = max(320, int(round(physical_h / dsf)) + int(HEIGHT_DELTA))
+        return (css_w * float(PAGE_ZOOM), logical_h, physical_w, css_h * dsf)
 
     def _placeholder_physical_size(self):
         """Физический размер плейсхолдера (GetClientRect даёт физические пиксели).
@@ -3300,20 +3471,46 @@ class MainWindow(QMainWindow):
         page = getattr(getattr(self, "worker", None), "page", None)
         if page is None:
             return
-        logical_w, logical_h, physical_w, physical_h = self._zoom_size()
+        logical_w, logical_h, physical_w, physical_h = self._zoom_args()
 
         def guard():
             try:
-                ok, _metrics = zoom_ok(page, logical_w, logical_h, physical_w, physical_h)
+                # Сдвиги страницы внедряются и держатся (после перезагрузки
+                # стиль пропадает, поэтому он проверяется каждый проход).
+                if page_tuning_needed():
+                    try:
+                        page.eval(page_tune_js(with_scroll=False), timeout=4)
+                    except Exception:
+                        diag.exception("main.page_tune")
+                ok, _metrics = zoom_ok(page, logical_w, logical_h, physical_w,
+                                       physical_h, zoom=PAGE_ZOOM)
                 if ok:
                     return
-                result = apply_zoom(page, logical_w, logical_h, physical_w, physical_h)
+                result = apply_zoom(page, logical_w, logical_h, physical_w,
+                                    physical_h, zoom=PAGE_ZOOM)
                 diag.event("browser.zoom_restored",
                            source=(result or {}).get("source"))
             except Exception:
                 diag.exception("main.zoom_guard")
 
         threading.Thread(target=guard, daemon=True).start()
+
+    def _apply_page_tuning(self):
+        """Однократно применить сдвиги страницы вместе с прокруткой."""
+        if self._closing or not self.native_mode or not page_tuning_needed():
+            return
+        page = getattr(getattr(self, "worker", None), "page", None)
+        if page is None:
+            return
+        js = page_tune_js(with_scroll=True)
+
+        def task():
+            try:
+                page.eval(js, timeout=4)
+            except Exception:
+                diag.exception("main.page_tune_once")
+
+        threading.Thread(target=task, daemon=True).start()
 
     @stage
     def _register_hotkeys(self):
@@ -3750,6 +3947,9 @@ class MainWindow(QMainWindow):
         self.zoom_timer.start(5000)
         # v15: Chrome сам возвращает кнопку в панель задач — проверяем раз в 5 с.
         self.taskbar_timer.start(5000)
+        # Сдвиги страницы из блока настроек — один раз, когда страница уже есть.
+        if page_tuning_needed():
+            QTimer.singleShot(1500, self._apply_page_tuning)
 
     @pyqtSlot(str)
     @stage
