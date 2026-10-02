@@ -985,6 +985,19 @@ class SyncUser32:
         return 1
 
 
+class ClampedCDPPage(TuneCDPPage):
+    """Сайт жёстко держит высоту: измерение никогда не совпадёт с целью."""
+
+    def send(self, method, params=None, timeout=None):
+        params = dict(params or {})
+        self.calls.append((method, params))
+        if method == 'Emulation.setDeviceMetricsOverride':
+            self.w = int(params.get('width') or 0)
+            self.dpr = float(params.get('deviceScaleFactor') or 1.0)
+            self.sw = self.w
+        return {}
+
+
 class DualCDPPage(TuneCDPPage):
     """Отдаёт оба формата: `iw/ih` (layout_tune) и `w/h` (native_browser)."""
 
@@ -1006,6 +1019,9 @@ class LayoutTuneTests(unittest.TestCase):
     v13 («полностью рабочая»). Поэтому каждое решение здесь сравнивается с
     уже проверенным на Windows `native_browser.zoom_ok`.
     """
+
+    def setUp(self):
+        layout_tune.reset_history()
 
     def test_default_tune_means_the_v13_layout(self):
         self.assertTrue(layout_tune.is_default(layout_tune.DEFAULTS))
@@ -1097,6 +1113,27 @@ class LayoutTuneTests(unittest.TestCase):
         self.assertAlmostEqual(after["inner"]["w"] * after["inner"]["dpr"], 413, delta=1)
         self.assertAlmostEqual(after["inner"]["h"] * after["inner"]["dpr"], 651, delta=1)
 
+    def test_a_target_that_never_converges_does_not_rebuild_the_layout(self):
+        # Сайт жёстко держит высоту: цель не сходится никогда. Раньше сторож
+        # зума каждые 5 с заново прогонял лестницу — страница «гуляла».
+        page = ClampedCDPPage(680, 1102, 2 / 3)
+        tune = layout_tune.normalize({"height_delta": -127, "offset_y": -5})
+        first = layout_tune.apply(page, tune, GEOM, settle=0)
+        self.assertEqual(first["source"], "emulation-failed")
+        calls_after_first = len(page.calls)
+        self.assertGreater(calls_after_first, 0)
+
+        # Тот же вызов от сторожа зума: цель та же, «остывание» не вышло.
+        second = layout_tune.apply(page, tune, GEOM, settle=0)
+        self.assertEqual(second["source"], "cooldown")
+        self.assertEqual(len(page.calls), calls_after_first)   # страницу не тронули
+        # ...но сдвиги всё равно внедряются.
+        self.assertTrue(page.injected)
+
+        # Принудительно (кнопка «Применить») лестница выполняется всегда.
+        third = layout_tune.apply(page, tune, GEOM, settle=0, force=True)
+        self.assertNotEqual(third["source"], "cooldown")
+
     def test_the_browser_window_is_itself_a_tunable_object(self):
         """pre14: окном браузера управляют ползунки — это и лечит «уехало вниз»."""
         user32 = SyncUser32((453, 735))
@@ -1138,17 +1175,23 @@ class LayoutTuneTests(unittest.TestCase):
             self.assertIn(name, methods, name)
         self.assertIn('AdminPanel', source)
         self.assertIn('HOTKEY_ADMIN_ID', source)
-        # Сдвигов нет -> прежний путь v13; сдвиги есть -> измерительный.
+        # Сдвигов нет -> прежний путь v13; сдвиги есть -> тот же конвейер,
+        # что у панели (два независимых применителя растаскивали страницу).
         guard = ast.unparse(methods['_ensure_zoom'])
-        self.assertIn('layout_tune.is_default(tune)', guard)
+        self.assertIn('layout_tune.is_default(self.tune)', guard)
+        self.assertIn('_apply_tune_page', guard)
         self.assertIn('zoom_ok(page', guard)
         self.assertIn('apply_zoom(page', guard)
-        self.assertIn('layout_tune.apply(page', guard)
         # Панель не может заблокировать GUI: раскладка применяется в потоке.
-        self.assertIn('daemon=True', ast.unparse(methods['_apply_tune_page']))
-        # Окно браузера двигается из GUI-потока, а страница — через CDP.
-        self.assertIn('_apply_window_inset', ast.unparse(methods['_apply_tune']))
-        self.assertIn('layout_tune.apply(page', ast.unparse(methods['_apply_tune_page']))
+        page_src = ast.unparse(methods['_apply_tune_page'])
+        self.assertIn('daemon=True', page_src)
+        self.assertIn('layout_tune.apply(page', page_src)
+        self.assertIn('_apply_window_inset', page_src)
+        # Очередь: значение не применяется напрямую, а только нумеруется.
+        queue = ast.unparse(methods['_apply_tune'])
+        self.assertIn('_tune_seq += 1', queue)
+        self.assertIn('if self._tune_busy', queue)
+        self.assertIn('self._apply_tune_page()', queue)
 
     def test_admin_panel_builds_every_knob_and_reports(self):
         source = (ROOT / 'layout_tune_ui.py').read_text()
@@ -1181,6 +1224,188 @@ class LayoutTuneTests(unittest.TestCase):
         # Без третьего ключа поведение v13 не меняется вообще.
         self.assertEqual(sorted(monitor.keys), [win32_hotkeys.ID_TOGGLE_VISIBILITY,
                                                 win32_hotkeys.ID_MIC])
+
+
+class TunePipeline:
+    """Один и тот же конвейер, что в MainWindow, но на заглушках.
+
+    PyQt6 на Linux недоступен (нет libGL), поэтому методы вынимаются из
+    main.py через AST и исполняются с подставными QTimer/диагностикой.
+    Нужно именно исполнение, а не просмотр текста: дефект «перемещается и
+    возвращается обратно» живёт в порядке вызовов, а не в их наличии.
+    """
+
+    def __init__(self):
+        self._closing = False
+        self.native_mode = True
+        self._tune_busy = False
+        self._tune_seq = 0
+        self._tune_force = False
+        self.tune = dict(layout_tune.DEFAULTS)
+        self.pending = []          # отложенные QTimer.singleShot(0, …)
+        self.window_moves = 0
+        self.applied = []
+        self._page = TuneCDPPage(680, 1102, 2 / 3)
+        self._bind()
+
+    # ------------------------------------------------------------------ glue
+    def _bind(self):
+        source = (ROOT / 'main.py').read_text()
+        tree = ast.parse(source)
+        window = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                      and n.name == 'MainWindow')
+        nodes = {n.name: n for n in window.body if isinstance(n, ast.FunctionDef)}
+        for name in ('_apply_tune', '_apply_tune_page', '_apply_window_inset'):
+            node = nodes[name]
+            body = list(node.body)
+            if isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+                body = body[1:]
+            clone = ast.FunctionDef(name=name, args=node.args, body=body,
+                                    decorator_list=[], returns=None,
+                                    type_comment=None, type_params=[])
+            ast.fix_missing_locations(clone)
+            scope = {'QTimer': self, 'threading': threading, 'layout_tune': layout_tune,
+                     'diag': FakeDiag(), 'dict': dict, 'bool': bool,
+                     'Exception': Exception}
+            exec(compile(ast.Module(body=[clone], type_ignores=[]),
+                         '<%s>' % name, 'exec'), scope)
+            setattr(self, name, scope[name].__get__(self))
+
+    def singleShot(self, _ms, callback):       # подмена QTimer.singleShot
+        self.pending.append(callback)
+
+    def _current_page(self):
+        return self._page
+
+    def tune_geom(self):
+        return dict(GEOM)
+
+    def _window_inset(self):
+        return tuple(self.tune.get(k, 0) for k in ('win_dx', 'win_dy', 'win_dw', 'win_dh'))
+
+    # ------------------------------------------------------------------ run
+    def settle(self, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            while self.pending:
+                self.pending.pop(0)()
+            if not self._tune_busy:
+                break
+            time.sleep(0.005)
+        while self.pending:
+            self.pending.pop(0)()
+
+
+class FakeDiag:
+    def exception(self, *args, **kwargs):
+        pass
+
+    def event(self, *args, **kwargs):
+        pass
+
+
+class TunePipelineTests(unittest.TestCase):
+    """Регрессия: «режим администратора перемещается и возвращается обратно».
+
+    Причина была в том, что каждое движение ползунка запускало применение
+    независимо: они доезжали в произвольном порядке, а сторож зума (5 с)
+    применял цель ещё и параллельно с панелью. Итоговое состояние оказывалось
+    старым значением — визуально «вернулось обратно».
+    """
+
+    def _pipeline(self):
+        return TunePipeline()
+
+    def test_the_cooldown_does_not_block_a_changed_value(self):
+        # «Остывание» действует только на ТУ ЖЕ цель: новое значение всегда
+        # пробуется сразу (иначе ползунок перестал бы работать).
+        page = ClampedCDPPage(680, 1102, 2 / 3)
+        layout_tune.apply(page, layout_tune.normalize({"height_delta": -100}),
+                          GEOM, settle=0)
+        calls = len(page.calls)
+        layout_tune.apply(page, layout_tune.normalize({"height_delta": -140}),
+                          GEOM, settle=0)
+        self.assertGreater(len(page.calls), calls)
+
+    def test_a_newer_value_always_wins(self):
+        # Применение медленное; пока оно идёт, администратор крутит ползунок
+        # ещё три раза. Итог обязан равняться ПОСЛЕДНЕМУ значению.
+        pipe = self._pipeline()
+        seen = []
+
+        def slow_apply(page, tune, geom, **kwargs):
+            seen.append(int(tune["offset_y"]))
+            time.sleep(0.05)
+            return {"ok": True, "source": "native", "css": (680, 1102),
+                    "dsf": 2 / 3, "zoom": 2 / 3, "measure": {}}
+
+        with patch.object(layout_tune, 'apply', side_effect=slow_apply):
+            for value in (0, -10, -20, -30):
+                pipe.tune = layout_tune.normalize({"offset_y": value})
+                pipe._apply_tune()
+                time.sleep(0.01)   # воркер успевает стартовать
+            pipe.settle()
+        self.assertEqual(seen[-1], -30)
+        self.assertIn(-30, seen)
+
+    def test_only_one_apply_runs_at_a_time(self):
+        # В конвейере ровно один рабочий поток: вложенных применений нет.
+        pipe = self._pipeline()
+        running = []
+        peak = []
+
+        def slow_apply(page, tune, geom, **kwargs):
+            running.append(1)
+            peak.append(len(running))
+            time.sleep(0.05)
+            running.pop()
+            return {"ok": True, "source": "native", "css": (680, 1102),
+                    "dsf": 2 / 3, "zoom": 2 / 3, "measure": {}}
+
+        with patch.object(layout_tune, 'apply', side_effect=slow_apply):
+            for value in (0, -5, -10, -15, -20):
+                pipe.tune = layout_tune.normalize({"offset_y": value})
+                pipe._apply_tune()
+            pipe.settle()
+        self.assertEqual(max(peak), 1)
+
+    def test_the_zoom_guard_uses_the_same_queue_not_a_second_applier(self):
+        # Сторож зума (5 с) не применяет сдвиги сам — он ставит их в ту же
+        # очередь. Иначе сторож и панель тянут страницу в разные стороны.
+        source = (ROOT / 'main.py').read_text()
+        tree = ast.parse(source)
+        window = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                      and n.name == 'MainWindow')
+        guard = next(n for n in window.body if isinstance(n, ast.FunctionDef)
+                     and n.name == '_ensure_zoom')
+        text = ast.unparse(guard)
+        self.assertIn('if not layout_tune.is_default(self.tune)', text)
+        self.assertIn('QTimer.singleShot(0, self._apply_tune_page)', text)
+        self.assertNotIn('layout_tune.apply(page', text)
+        self.assertNotIn('layout_tune.ok(page', text)
+
+    def test_the_window_is_not_moved_twice_into_the_same_box(self):
+        # Повторный SetWindowPos с тем же прямоугольником — главный источник
+        # «возвращается обратно»: асинхронный вызов приходит ПОСЛЕ свежего.
+        user32 = SyncUser32((453, 735))
+        host = SimpleNamespace(synced_box=None, inset=(0, 0, 0, 0))
+        self.assertEqual(win32_embed.box_for(user32, 22, (0, 0, 0, 0)), (0, 0, 453, 735))
+        self.assertEqual(win32_embed.box_for(user32, 22, (20, 54, 20, 30)),
+                         (20, 54, 413, 651))
+        self.assertIsNone(win32_embed.box_for(user32, 22, (400, 700, 400, 700)))
+        # Синхронный режим не ставит SWP_ASYNCWINDOWPOS.
+        self.assertEqual(win32_embed.sync(user32, 11, 22, (20, 54, 20, 30),
+                                          async_pos=False), (20, 54, 413, 651))
+        self.assertEqual(len(user32.moves), 1)
+
+    def test_live_dragging_does_not_force_the_page(self):
+        # Живое применение не форсирует: если замер совпал — страницу не
+        # трогают. Принудительно — только по кнопке «Применить».
+        source = (ROOT / 'layout_tune_ui.py').read_text()
+        self.assertIn('def _push(self, force=False)', source)
+        self.assertIn('self._debounce.setInterval(350)', source)
+        self.assertIn('self._push(force=True)', source)     # кнопка «Применить»
+        self.assertIn('lambda _c=False: self._push(force=True)', source)
 
 
 class SpeechBackendTests(unittest.TestCase):

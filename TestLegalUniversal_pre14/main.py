@@ -2261,6 +2261,9 @@ class NativeHost(QObject):
         self.focus_bridge = None
         # pre14: сдвиг/размер окна браузера внутри плейсхолдера, физические px.
         self.inset = (0, 0, 0, 0)
+        # Куда окно уже поставлено: повторный SetWindowPos с тем же
+        # прямоугольником не нужен, а асинхронный — вреден (см. sync).
+        self.synced_box = None
         self.app_dir = Path(app_dir) if app_dir else Path(sys.argv[0]).resolve().parent
         self.profile = Path(profile) if profile else BROWSER_PROFILE
         self.timer = QTimer(self)
@@ -2362,7 +2365,9 @@ class NativeHost(QObject):
         self.hwnd = hwnd
         self.stage = "ready"
         self.timer.stop()
-        win32_embed.sync(self.user32, hwnd, parent, self.inset)
+        # Синхронно: к моменту `ready` окно уже стоит там, где нужно, и
+        # повторные синхронизации из GUI не будут его дёргать.
+        self.sync(async_pos=False, force=True)
         diag.event("browser.embedded", hwnd=int(hwnd), parent=parent, port=self.port,
                    exe=self.native.exe, kind=self.native.kind)
         self.ready.emit(int(self.port))
@@ -2409,12 +2414,27 @@ class NativeHost(QObject):
         return True
 
     # --------------------------------------------------------------- helpers
-    def sync(self):
+    def sync(self, async_pos=True, force=False):
+        """Держать окно на месте.
+
+        Повторный вызов с тем же прямоугольником ничего не делает: окно и так
+        стоит там, а лишний асинхронный SetWindowPos может прийти ПОСЛЕ более
+        свежего синхронного — тогда окно визуально «возвращается» назад.
+        `force=True` ставит окно всегда (его использует режим администратора).
+        """
         if not (self.hwnd and self.placeholder):
             return
         try:
-            win32_embed.sync(self.user32, self.hwnd, int(self.placeholder.winId()),
-                             self.inset)
+            parent = int(self.placeholder.winId())
+            box = win32_embed.box_for(self.user32, parent, self.inset)
+            if box is None:
+                return
+            if not force and box == self.synced_box:
+                return
+            applied = win32_embed.sync(self.user32, self.hwnd, parent, self.inset,
+                                       async_pos=async_pos)
+            if applied is not None:
+                self.synced_box = applied
         except Exception:
             diag.exception("main.sync_geometry")
 
@@ -2826,7 +2846,11 @@ class MainWindow(QMainWindow):
         self.tune = layout_tune.load(self.cfg)
         self.admin_mode = self._admin_enabled()
         self.admin_panel = None
+        # Очередь применения: `_tune_seq` — номер текущего значения,
+        # `_tune_force` — признак «применить даже если замер совпал».
         self._tune_busy = False
+        self._tune_seq = 0
+        self._tune_force = False
         self.hotkeys = HotkeyMonitor(on_event=self._on_hotkey)
         # Опрос GetAsyncKeyState из главного потока Qt (~25 мс): работает с
         # любым фокусом/раскладкой и не может "не сработать".
@@ -3267,8 +3291,14 @@ class MainWindow(QMainWindow):
         if host is None or not getattr(self, "native_mode", False):
             return
         try:
-            host.inset = self._window_inset()
-            host.sync()
+            inset = self._window_inset()
+            host.inset = inset
+            if inset == getattr(self, "_last_inset", None):
+                return          # уже стоит там же — не дёргаем окно лишний раз
+            self._last_inset = inset
+            # СИНХРОННО: сразу после вызова GetClientRect окна вернёт новый
+            # размер, и цель раскладки будет посчитана от настоящего окна.
+            host.sync(async_pos=False, force=True)
         except Exception:
             diag.exception("main.window_inset")
 
@@ -3281,23 +3311,46 @@ class MainWindow(QMainWindow):
         self._apply_tune(force=force)
 
     def _apply_tune(self, force=False):
-        """Применить положение объектов: окно (Win32) + страница (CDP)."""
-        if self._closing or not self.native_mode or self._tune_busy:
-            return
-        self._apply_window_inset()
-        # SetWindowPos асинхронный: даём окну осесть, иначе физический размер
-        # прочитается старым и вся раскладка будет посчитана не от того окна.
-        QTimer.singleShot(250, lambda: self._apply_tune_page(force))
+        """Поставить в очередь новое значение (окно + страница).
 
-    def _apply_tune_page(self, force=False):
-        """Раскладка страницы под сдвиги администратора (фоновый поток)."""
+        Ничего не применяется напрямую: пока идёт предыдущее применение, новое
+        значение только запоминается (`_tune_seq`). Иначе применения из
+        ползунков накладываются друг на друга, доезжают в произвольном порядке
+        и страница «перемещается и возвращается обратно» — то самое, на что
+        жаловался администратор.
+        """
+        if self._closing or not self.native_mode:
+            return
+        self._tune_seq += 1
+        self._tune_force = bool(force or self._tune_force)
+        if self._tune_busy:
+            # Рабочий поток сам подхватит самое свежее значение по `_tune_seq`.
+            return
+        self._apply_tune_page()
+
+    def _apply_tune_page(self):
+        """Одно применение: окно (Win32, синхронно) + страница (CDP, в потоке).
+
+        Строго одно за раз (`_tune_busy`). Если за время работы значение успели
+        изменить — применяется САМОЕ СВЕЖЕЕ, а не то, что было в очереди
+        первым. Так итоговое состояние всегда равно последнему движению
+        ползунка, сколько бы раз его ни дёргали.
+        """
         if self._closing or not self.native_mode or self._tune_busy:
             return
+        # Окно двигаем здесь: после синхронного SetWindowPos физический размер
+        # окна актуален, и `tune_geom` считает цель от настоящего окна.
+        self._apply_window_inset()
         page = self._current_page()
         if page is None:
+            self._tune_force = False
+            self._tune_seq += 1     # это состояние отработает сторож зума
             return
+        seq = self._tune_seq
+        force = bool(self._tune_force)
+        self._tune_force = False
         geom = self.tune_geom()
-        tune = self.tune
+        tune = dict(self.tune)
 
         def task():
             self._tune_busy = True
@@ -3307,6 +3360,9 @@ class MainWindow(QMainWindow):
                 diag.exception("main.apply_tune")
             finally:
                 self._tune_busy = False
+            # Пока применяли, значение успели поменять: берём последнее.
+            if self._tune_seq != seq and not self._closing:
+                QTimer.singleShot(0, self._apply_tune_page)
 
         threading.Thread(target=task, daemon=True).start()
 
@@ -3376,27 +3432,19 @@ class MainWindow(QMainWindow):
             return
         logical_w, logical_h, physical_w, physical_h = self._zoom_size()
 
-        geom = self.tune_geom()
-        tune = self.tune
-
         def guard():
             try:
-                if layout_tune.is_default(tune):
-                    # Сдвигов нет: ровно прежний, проверенный на Windows путь v13.
-                    ok, _metrics = zoom_ok(page, logical_w, logical_h, physical_w, physical_h)
-                    if ok:
-                        return
-                    result = apply_zoom(page, logical_w, logical_h, physical_w, physical_h)
-                else:
-                    ok, _metrics = layout_tune.ok(page, tune, geom)
-                    if ok:
-                        # Сдвиги живут в DOM: после перезагрузки страницы их
-                        # нужно вернуть, не трогая зум.
-                        if not layout_tune.injected(page):
-                            layout_tune.inject(page, tune, geom)
-                            diag.event("layout.tune_restored", source="inject")
-                        return
-                    result = layout_tune.apply(page, tune, geom)
+                # Сдвиги заданы: их применяет ТОТ ЖЕ конвейер, что и панель
+                # администратора. Два независимых применителя — это ровно то,
+                # отчего страница «перемещается и возвращается обратно».
+                if not layout_tune.is_default(self.tune):
+                    QTimer.singleShot(0, self._apply_tune_page)
+                    return
+                # Сдвигов нет: ровно прежний, проверенный на Windows путь v13.
+                ok, _metrics = zoom_ok(page, logical_w, logical_h, physical_w, physical_h)
+                if ok:
+                    return
+                result = apply_zoom(page, logical_w, logical_h, physical_w, physical_h)
                 diag.event("browser.zoom_restored",
                            source=(result or {}).get("source"))
             except Exception:
@@ -3811,6 +3859,7 @@ class MainWindow(QMainWindow):
                           width=W, height=H,
                           configured=(self.cfg.get("browser_path") or None))
         host.inset = self._window_inset()
+        self._last_inset = host.inset
         host.ready.connect(self._on_browser_ready)
         host.failed.connect(self._on_browser_failed)
         self.browser_host = host

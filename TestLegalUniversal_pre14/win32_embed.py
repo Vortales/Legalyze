@@ -355,34 +355,57 @@ def embed(user32, hwnd, parent):
         return False
 
 
-def sync(user32, hwnd, parent, inset=(0, 0, 0, 0)):
+def box_for(user32, parent, inset=(0, 0, 0, 0)):
+    """(x, y, w, h) окна браузера по размерам плейсхолдера и `inset`.
+
+    Считается ДО вызова SetWindowPos, поэтому вызывающий может понять, что окно
+    уже стоит там, куда его собираются поставить, — и не посылать лишний
+    асинхронный вызов (именно они и заставляли окно «возвращаться»).
+    """
+    if not user32 or not parent:
+        return None
+    width, height = client_size(user32, parent)
+    if width <= 0 or height <= 0:
+        return None
+    left, top, right, bottom = (int(v or 0) for v in (tuple(inset) + (0, 0, 0, 0))[:4])
+    box_w = width - left - right
+    box_h = height - top - bottom
+    if box_w <= 0 or box_h <= 0:
+        return None
+    return (left, top, box_w, box_h)
+
+
+def sync(user32, hwnd, parent, inset=(0, 0, 0, 0), async_pos=True):
     """Keep the child over the placeholder, honouring `inset`.
 
     `inset` = (left, top, right, bottom) in the placeholder's own PHYSICAL
     client pixels: pre14 сдвигает и уменьшает окно браузера под ползунки
     администратора, чтобы страница не уходила под панели GUI. Пустой inset
     (по умолчанию) даёт ровно прежнее поведение: окно == плейсхолдер.
+
+    `async_pos=False` убирает `SWP_ASYNCWINDOWPOS`: вызов становится
+    синхронным, и сразу после него `GetClientRect` окна возвращает НОВЫЙ
+    размер. Режим администратора обязан им пользоваться — иначе физический
+    размер читается старым, цель раскладки считается не от того окна, а
+    сторож зума через 5 с пересчитывает её заново: страница «гуляет».
     """
     if not user32 or not hwnd or not parent:
-        return False
-    width, height = client_size(user32, parent)
-    if width <= 0 or height <= 0:
-        return False
-    left, top, right, bottom = (int(v or 0) for v in (tuple(inset) + (0, 0, 0, 0))[:4])
-    x, y = left, top
-    box_w = width - left - right
-    box_h = height - top - bottom
-    if box_w <= 0 or box_h <= 0:
-        diag.event("win32.SetWindowPos.bad_inset", inset=[left, top, right, bottom],
-                   client=[width, height])
-        return False
+        return None
+    box = box_for(user32, parent, inset)
+    if box is None:
+        diag.event("win32.SetWindowPos.bad_inset", inset=list(tuple(inset)[:4]),
+                   parent=parent)
+        return None
+    x, y, box_w, box_h = box
+    flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED
+    if async_pos:
+        flags |= SWP_ASYNCWINDOWPOS
     _set_last_error(0)
-    ok = user32.SetWindowPos(hwnd, None, x, y, box_w, box_h,
-                             SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW |
-                             SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS)
+    ok = user32.SetWindowPos(hwnd, None, x, y, box_w, box_h, flags)
     if not ok:
         diag.event("win32.SetWindowPos.failed", error=_get_last_error())
-    return bool(ok)
+        return None
+    return box
 
 
 def is_window(user32, hwnd):

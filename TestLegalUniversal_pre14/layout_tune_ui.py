@@ -189,7 +189,9 @@ class AdminPanel(QWidget):
         self._last_report = ""
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
-        self._debounce.setInterval(220)
+        # 350 мс: пока ползунок тянут, применение не стартует на каждое
+        # деление шкалы — иначе применения накладываются друг на друга.
+        self._debounce.setInterval(350)
         self._debounce.timeout.connect(self._push)
 
         self.setObjectName("adminPanel")
@@ -252,7 +254,8 @@ class AdminPanel(QWidget):
         buttons = QHBoxLayout()
         buttons.setSpacing(6)
         self.btn_apply = QPushButton("Применить")
-        self.btn_apply.clicked.connect(lambda _c=False: self._push())
+        self.btn_apply.setToolTip("Применить принудительно (даже если замер совпал)")
+        self.btn_apply.clicked.connect(lambda _c=False: self._push(force=True))
         buttons.addWidget(self.btn_apply)
         self.btn_auto = QPushButton("Авто: окно в слот")
         self.btn_auto.setToolTip(
@@ -330,12 +333,17 @@ class AdminPanel(QWidget):
         if self.live_box.isChecked():
             self._debounce.start()
 
-    def _push(self):
+    def _push(self, force=False):
+        """Поставить значение в очередь. `force` — только по кнопке «Применить».
+
+        Живое применение НЕ форсирует: если замер уже совпадает с целью,
+        страницу не трогают вовсе (меньше перерисовок — меньше «миганий»).
+        """
         self._debounce.stop()
         self.tune = self.collect()
         try:
             self.owner.tune = self.tune
-            self.owner.apply_tune(force=True)
+            self.owner.apply_tune(force=force)
             self._status("Применено: " + self._short())
         except Exception:
             diag.exception("layout_tune_ui.push")

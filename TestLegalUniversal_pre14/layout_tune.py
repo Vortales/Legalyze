@@ -413,6 +413,13 @@ def inject(page, tune=None, geom=None):
         payload["fh"] = int(round(max(0.0, float(logical[1]) - frame["top"] - frame["bottom"]) * css_per_dip))
     if page is None:
         return False
+    nothing = not (payload["frame"] or payload["offset_x"] or payload["offset_y"]
+                   or payload["input_dx"] or payload["input_dy"]
+                   or payload["pad_bottom"] or payload["scroll_x"]
+                   or payload["scroll_y"])
+    # Внедрять нечего и раньше ничего не внедряли — не трогаем страницу вообще.
+    if nothing and not injected(page):
+        return True
     try:
         page.eval(tune_js(payload), timeout=4)
     except Exception:
@@ -445,7 +452,25 @@ def ok(page, tune=None, geom=None, tol_w=28, tol_h=48):
     return True, data
 
 
-def apply(page, tune=None, geom=None, settle=0.2, steps=3, force=False):
+#: Последняя цель, которую уже пробовали поставить: (цель, время, сошлась,
+#: страница). Ссылка на страницу хранится, чтобы `id()` не переиспользовался.
+_LAST = {}
+
+
+def reset_history():
+    """Забыть историю попыток (для тестов и полного сброса)."""
+    _LAST.clear()
+
+
+def _last_attempt(page, target):
+    entry = _LAST.get(id(page))
+    if entry and entry[-1] is page and entry[0] == target:
+        return entry
+    return None
+
+
+def apply(page, tune=None, geom=None, settle=0.2, steps=3, force=False,
+          cooldown=30.0):
     """Применить настройку и ВЕРНУТЬ ИЗМЕРЕННЫЙ результат (без исключений).
 
     1. Сначала замер: если страница уже такой ширины/высоты — ничего не
@@ -454,6 +479,11 @@ def apply(page, tune=None, geom=None, settle=0.2, steps=3, force=False):
        измерению: ни перезапуска браузера, ни нажатий клавиш, ни смены профиля.
     3. Затем внедряются сдвиги и рамка видимой области.
     4. Всё заканчивается замером — по нему администратор видит эффект.
+
+    `cooldown`: если та же самая цель уже пробовалась и НЕ сошлась
+    (например, сайт жёстко задаёт минимальную высоту), лестница не
+    повторяется раньше чем через `cooldown` секунд. Без этого сторож зума
+    каждые 5 с заново перестраивал раскладку — и страница «гуляла».
     """
     tune = normalize(tune)
     logical, physical, frame, _meta = split_geom(geom)
@@ -469,12 +499,23 @@ def apply(page, tune=None, geom=None, settle=0.2, steps=3, force=False):
     result["css"] = (css_w, css_h)
     result["dsf"] = round(dsf, 4)
 
+    attempt = None if force else _last_attempt(page, result["css"])
+    cooling = bool(attempt and (time.monotonic() - attempt[1]) < float(cooldown))
+
     already, _data = (False, {})
     if not force:
         already, _data = ok(page, tune, geom)
     if already:
         result["source"] = "native"
+        _LAST.pop(id(page), None)
+    elif cooling:
+        # Та же цель, и в прошлый раз она НЕ сошлась (например, сайт жёстко
+        # задаёт минимальную высоту): не перестраиваем раскладку каждые 5 с —
+        # иначе сторож зума заставляет страницу «гулять». Сдвиги и рамка всё
+        # равно внедряются ниже.
+        result["source"] = "cooldown"
     else:
+        _LAST.pop(id(page), None)
         width, height = css_w, css_h
         fitted = False
         for _step in range(max(1, int(steps))):
@@ -501,6 +542,8 @@ def apply(page, tune=None, geom=None, settle=0.2, steps=3, force=False):
         result["dsf"] = round((float(physical[0] or logical[0]) / width) if width else 1.0, 4)
         result["source"] = "emulation-adaptive" if fitted else "emulation-failed"
         result["ok"] = bool(fitted)
+        if not fitted:
+            _LAST[id(page)] = (result["css"], time.monotonic(), False, page)
     inject(page, tune, geom)
     if not force and already:
         result["ok"] = True
