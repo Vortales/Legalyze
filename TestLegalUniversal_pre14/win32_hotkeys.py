@@ -27,10 +27,13 @@ IS_WINDOWS = sys.platform == "win32"
 # Идентификаторы действий (бизнес-код main.py использует их как раньше).
 ID_TOGGLE_VISIBILITY = 1
 ID_MIC = 2
+# pre14: режим администратора (панель положения объектов страницы).
+ID_ADMIN = 3
 
 # Совместимость с прежними именами (main.py, тесты).
 HOTKEY_TOGGLE_ID = ID_TOGGLE_VISIBILITY
 HOTKEY_MIC_ID = ID_MIC
+HOTKEY_ADMIN_ID = ID_ADMIN
 
 WM_HOTKEY = 0x0312
 MOD_NOREPEAT = 0x4000
@@ -205,11 +208,15 @@ class HotkeyMonitor:
     def keys(self) -> Dict[int, int]:
         return dict(self._keys)
 
-    def set_keys(self, toggle_vk: int, mic_vk: int) -> bool:
+    def set_keys(self, toggle_vk: int, mic_vk: int, admin_vk: int = 0) -> bool:
         self._keys = {
             ID_TOGGLE_VISIBILITY: int(toggle_vk or 0),
             ID_MIC: int(mic_vk or 0),
         }
+        # Третий ключ добавляется только когда он реально задан:
+        # сборки без режима администратора не получают лишнего опроса.
+        if int(admin_vk or 0):
+            self._keys[ID_ADMIN] = int(admin_vk)
         # Сбрасываем "край нажатия": новая клавиша не должна выстрелить
         # от того, что её держат в момент переназначения.
         self._down = {key_id: False for key_id in self._keys}

@@ -667,119 +667,9 @@ def target_css(logical_w, logical_h, physical_w=None, physical_h=None,
     css_w = max(320, int(round(logical_w / zoom)))
     physical_w = physical_w or logical_w
     physical_h = physical_h or logical_h
-    # Ширина, к которой `refine_fit` уже подогнал страницу: иначе сторож зума
-    # каждые 5 секунд возвращал бы раскладку назад и экран «дышал».
-    fitted = _fit_width(logical_w, logical_h, physical_w, physical_h)
-    if fitted:
-        css_w = min(max(320, int(fitted)), int(css_w * 2))
     dsf = (float(physical_w) / css_w) if css_w else 1.0
     css_h = max(320, int(round(float(physical_h) / dsf)))
     return css_w, css_h, dsf
-
-
-# (logical, physical) -> ширина раскладки, к которой сошлась подгонка
-_FIT = {"key": None, "css_w": None}
-
-
-def _fit_key(logical_w, logical_h, physical_w, physical_h):
-    return (int(logical_w), int(logical_h), int(physical_w or logical_w),
-            int(physical_h or logical_h))
-
-
-def _fit_width(logical_w, logical_h, physical_w, physical_h):
-    if _FIT["key"] != _fit_key(logical_w, logical_h, physical_w, physical_h):
-        return None
-    return _FIT["css_w"]
-
-
-FIT_PROBE = (
-    "JSON.stringify({"
-    "iw: innerWidth, ih: innerHeight,"
-    " sw: document.documentElement ? document.documentElement.scrollWidth : innerWidth,"
-    " ib: (function(){try{var e=document.querySelector("
-    "'textarea, div[contenteditable=\"true\"], rich-textarea, [role=\"textbox\"]');"
-    " if(!e) return 0; var r=e.getBoundingClientRect();"
-    " return Math.round(r.bottom);}catch(err){return 0}})()"
-    "})"
-)
-
-
-def fit_metrics(page):
-    """Помещается ли страница целиком: переполнение справа и низ поля ввода.
-
-    * `scrollWidth - innerWidth` > 0 — страница шире окна (именно так и
-      выглядит «съехало вправо»);
-    * `inputBottom - innerHeight` > 0 — поле ввода ниже видимой части
-      («окно запроса улетело вниз»).
-    """
-    try:
-        value = page.eval(FIT_PROBE, timeout=3).get("value")
-        data = json.loads(value or "{}")
-    except Exception:
-        diag.exception("native_browser.fit_metrics")
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    return {"innerWidth": int(data.get("iw") or 0),
-            "innerHeight": int(data.get("ih") or 0),
-            "scrollWidth": int(data.get("sw") or 0),
-            "inputBottom": int(data.get("ib") or 0)}
-
-
-def refine_fit(page, logical_w, logical_h, physical_w, physical_h, zoom=ZOOM,
-               settle=0.25, steps=4, limit=1.4):
-    """Подогнать раскладку по ИЗМЕРЕНИЮ: страница должна влезть целиком.
-
-    Шире раскладка -> меньше масштаб: поверхность остаётся ровно равной
-    клиентской области окна, поэтому содержимое просто целиком помещается —
-    справа ничего не обрезано, а поле ввода видно. Решение принимает измерение,
-    а не догадка; максимум +30 % к расчётной ширине.
-    """
-    physical_w = physical_w or logical_w
-    physical_h = physical_h or logical_h
-    key = _fit_key(logical_w, logical_h, physical_w, physical_h)
-    base_w = max(320, int(round(logical_w / zoom)))
-    cap = max(base_w, int(base_w * limit))
-    metrics = fit_metrics(page)
-
-    def remember(width):
-        _FIT["key"] = key
-        _FIT["css_w"] = int(width)
-        diag.event("browser.fit", css_w=int(width), base=base_w, cap=cap,
-                   overflow=max(0, int(metrics.get("scrollWidth") or 0)
-                                - int(metrics.get("innerWidth") or 0)),
-                   input_below=max(0, int(metrics.get("inputBottom") or 0)
-                                   - int(metrics.get("innerHeight") or 0)))
-
-    css_w = target_css(logical_w, logical_h, physical_w, physical_h, zoom)[0]
-    for _step in range(max(1, int(steps))):
-        inner_w = int(metrics.get("innerWidth") or 0)
-        if not inner_w:
-            break
-        overflow = int(metrics.get("scrollWidth") or 0) - inner_w
-        below = int(metrics.get("inputBottom") or 0) - int(metrics.get("innerHeight") or 0)
-        if overflow <= 2 and below <= 0:
-            remember(css_w)
-            return True, css_w, metrics
-        # На сколько нужно расширить раскладку: по переполнению справа и по
-        # тому, насколько поле ввода ниже видимой части (оба — в долях окна).
-        overflow_ratio = float(max(0, overflow)) / float(inner_w)
-        below_ratio = float(max(0, below)) / float(max(1, metrics.get("innerHeight") or 1))
-        grow = min(0.25, max(overflow_ratio, below_ratio, 0.03))
-        new_w = min(cap, max(css_w + 8, int(round(css_w * (1.0 + grow)))))
-        if new_w <= css_w:
-            break
-        css_w = new_w
-        dsf = float(physical_w) / css_w
-        css_h = max(320, int(round(float(physical_h) / dsf)))
-        if not apply_viewport_raw(page, css_w, css_h, dsf):
-            break
-        time.sleep(settle)
-        metrics = fit_metrics(page)
-    remember(css_w)
-    overflow = int(metrics.get("scrollWidth") or 0) - int(metrics.get("innerWidth") or 0)
-    below = int(metrics.get("inputBottom") or 0) - int(metrics.get("innerHeight") or 0)
-    return (overflow <= 2 and below <= 0), css_w, metrics
 
 
 def zoom_factor(metrics, logical_w):
@@ -859,17 +749,9 @@ def apply_zoom(page, logical_w, logical_h, physical_w=None, physical_h=None,
                    **(metrics or {}))
         return {"ok": bool(ok), "source": source, "metrics": metrics}
 
-    def finish(source, before):
-        # Раскладка доведена по измерению, логи и результат — по ФАКТИЧЕСКИМ
-        # метрикам уже после подгонки (а не по тем, что были до неё).
-        refine_fit(page, logical_w, logical_h, physical_w, physical_h, zoom, settle)
-        ok_after, after = zoom_ok(page, logical_w, logical_h, physical_w, physical_h,
-                                  zoom)
-        return done(True, source, after if (ok_after and after) else before)
-
     ok, metrics = zoom_ok(page, logical_w, logical_h, physical_w, physical_h, zoom)
     if ok:
-        return finish("native", metrics)
+        return done(True, "native", metrics)
 
     attempts = (
         ("emulation-dsf", {}),
@@ -883,7 +765,7 @@ def apply_zoom(page, logical_w, logical_h, physical_w=None, physical_h=None,
         time.sleep(settle)
         ok, metrics = zoom_ok(page, logical_w, logical_h, physical_w, physical_h, zoom)
         if ok:
-            return finish(name, metrics)
+            return done(True, name, metrics)
 
     # Измерение вместо предположений: если зум профиля и эмуляция наложились,
     # видимая ширина отличается ровно во столько же раз, во сколько показало

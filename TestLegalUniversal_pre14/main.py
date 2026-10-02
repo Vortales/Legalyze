@@ -35,13 +35,12 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QCheckBox, QDialog, QComboBox,
     QFormLayout, QMessageBox, QInputDialog, QGraphicsDropShadowEffect,
-    QSizePolicy, QSystemTrayIcon, QMenu,
+    QSizePolicy,
 )
 from PyQt6.QtCore import (QTimer, QThread, pyqtSignal, Qt, QPoint, QRectF, QLockFile, pyqtSlot,
                           QObject)
 from PyQt6.QtGui import (
     QFont, QPainter, QColor, QPen, QBrush, QPainterPath, QKeySequence,
-    QIcon, QPixmap,
 )
 
 from config import (
@@ -83,6 +82,8 @@ BROWSER_PROFILE = APP_DIR / "browser-profile"
 
 
 X, Y, W, H = 1426, 200, 453, 735
+# pre14: панель администратора (положение объектов страницы).
+ADMIN_HOTKEY = "F8"
 
 GWL_STYLE = -16
 GWL_EXSTYLE = -20
@@ -342,13 +343,18 @@ MODIFIER_MAP = {
     "Win": 0x0008,
 }
 
-from win32_hotkeys import HotkeyMonitor, HOTKEY_TOGGLE_ID, HOTKEY_MIC_ID
+from win32_hotkeys import (HotkeyMonitor, HOTKEY_TOGGLE_ID, HOTKEY_MIC_ID,
+                          HOTKEY_ADMIN_ID)
 from web_compat import JS_PURGE, JS_MIC_TOGGLE, JS_MIC_STOP, JS_MIC_START, CONSENT_CLICK_JS
 from native_browser import (NativeBrowser, discover_browsers, choose_target,
                             apply_zoom, zoom_ok, grant_microphone,
-                            speech_surface, ZOOM)
+                            speech_surface)
 import win32_embed
 import browser_focus
+# pre14: режим администратора — сдвиги объектов страницы. При значениях по
+# умолчанию раскладка обязана совпасть с v13 (см. layout_tune.is_default).
+import layout_tune
+from layout_tune_ui import AdminPanel
 
 THEME = {
     "bg": "#0e1020",
@@ -2253,6 +2259,8 @@ class NativeHost(QObject):
         self.user32 = None
         self.kernel32 = None
         self.focus_bridge = None
+        # pre14: сдвиг/размер окна браузера внутри плейсхолдера, физические px.
+        self.inset = (0, 0, 0, 0)
         self.app_dir = Path(app_dir) if app_dir else Path(sys.argv[0]).resolve().parent
         self.profile = Path(profile) if profile else BROWSER_PROFILE
         self.timer = QTimer(self)
@@ -2343,16 +2351,6 @@ class NativeHost(QObject):
             if time.monotonic() > self.stage_deadline:
                 self._retry("window-timeout")
 
-    def hide_taskbar(self):
-        """Убрать окна браузера из панели задач (значок «G») и из Alt+Tab."""
-        if not self.user32:
-            return []
-        try:
-            return win32_embed.hide_browser_from_taskbar(self.user32, self.pids)
-        except Exception:
-            diag.exception("main.hide_taskbar")
-            return []
-
     def _embed(self, hwnd):
         parent = int(self.placeholder.winId()) if self.placeholder else 0
         if not parent:
@@ -2364,12 +2362,7 @@ class NativeHost(QObject):
         self.hwnd = hwnd
         self.stage = "ready"
         self.timer.stop()
-        win32_embed.sync(self.user32, hwnd, parent)
-        # Chrome регистрирует кнопку в панели задач сам — снимаем её сразу и
-        # ещё раз позже (браузер может вернуть кнопку после смены заголовка).
-        self.hide_taskbar()
-        QTimer.singleShot(1200, self.hide_taskbar)
-        QTimer.singleShot(4000, self.hide_taskbar)
+        win32_embed.sync(self.user32, hwnd, parent, self.inset)
         diag.event("browser.embedded", hwnd=int(hwnd), parent=parent, port=self.port,
                    exe=self.native.exe, kind=self.native.kind)
         self.ready.emit(int(self.port))
@@ -2420,7 +2413,8 @@ class NativeHost(QObject):
         if not (self.hwnd and self.placeholder):
             return
         try:
-            win32_embed.sync(self.user32, self.hwnd, int(self.placeholder.winId()))
+            win32_embed.sync(self.user32, self.hwnd, int(self.placeholder.winId()),
+                             self.inset)
         except Exception:
             diag.exception("main.sync_geometry")
 
@@ -2450,7 +2444,8 @@ class ChromeWorker(QThread):
     hwnd_ready = pyqtSignal(object)
     failed = pyqtSignal()
 
-    def __init__(self, parent=None, port=None, native=False, size=None, zoom=None):
+    def __init__(self, parent=None, port=None, native=False, size=None,
+                 tune=None, geom=None):
         super().__init__(parent)
         self.proc = None
         self.browser = None
@@ -2461,9 +2456,9 @@ class ChromeWorker(QThread):
         # (physical width, height) of the placeholder: the zoom is computed from
         # it, so the layout is identical at 100 %, 125 % and 150 %.
         self.size = size
-        # 2/3 — тот же зум, что в native_browser.ZOOM (числом, чтобы класс
-        # оставался самодостаточным: его собирают и отдельно, в тестах).
-        self.zoom = float(zoom) if zoom else (2.0 / 3.0)
+        # Режим администратора (pre14): сдвиги объектов + геометрия окна.
+        self.tune = tune
+        self.geom = geom
 
     def run(self):
         try:
@@ -2496,14 +2491,17 @@ class ChromeWorker(QThread):
                 self.failed.emit()
 
     def _apply_zoom(self):
-        """Native 67 % zoom, measured — never assumed (see native_browser.apply_zoom)."""
+        """Native 67 % zoom (+ сдвиги администратора) — measured, never assumed."""
         logical_w, logical_h, physical_w, physical_h = self.size or (W, H, W, H)
         if not logical_w or not logical_h:
             return
         try:
-            result = apply_zoom(self.page, int(logical_w), int(logical_h),
-                                int(physical_w or logical_w), int(physical_h or logical_h),
-                                zoom=self.zoom)
+            if self.geom and self.tune and not layout_tune.is_default(self.tune):
+                # Сдвиги заданы: зум и сдвиги ставятся одной измеренной лестницей.
+                result = layout_tune.apply(self.page, self.tune, self.geom)
+            else:
+                result = apply_zoom(self.page, int(logical_w), int(logical_h),
+                                    int(physical_w or logical_w), int(physical_h or logical_h))
         except Exception:
             diag.exception("webengine.zoom")
             return
@@ -2823,6 +2821,12 @@ class MainWindow(QMainWindow):
         self._hotkeys_registered = False
         self._chat_ready = False
         self._crash_recoveries = 0
+        # Режим администратора (pre14): сдвиги объектов страницы. Значения
+        # по умолчанию дают ровно поведение v13 (layout_tune.is_default).
+        self.tune = layout_tune.load(self.cfg)
+        self.admin_mode = self._admin_enabled()
+        self.admin_panel = None
+        self._tune_busy = False
         self.hotkeys = HotkeyMonitor(on_event=self._on_hotkey)
         # Опрос GetAsyncKeyState из главного потока Qt (~25 мс): работает с
         # любым фокусом/раскладкой и не может "не сработать".
@@ -2856,24 +2860,16 @@ class MainWindow(QMainWindow):
         self.central_widget.setStyleSheet(f"background: {THEME['bg']};")
         self.setCentralWidget(self.central_widget)
 
-        # Браузер живёт ВНУТРИ рамки приложения: сверху панель 54 px, снизу
-        # 30 px, по бокам по 20 px — именно эта область (самая) и видна
-        # пользователю. Раньше плейсхолдер занимал всё окно, поэтому панель
-        # сверху срезала верх страницы, а нижняя панель — поле ввода ИИ.
-        self.slot_w = int(W - 2 * self.side_inset)
-        self.slot_h = int(H - self.top_inset - self.bottom_inset)
         self.browser_placeholder = QWidget(self.central_widget)
-        self.browser_placeholder.setGeometry(self.side_inset, self.top_inset,
-                                             self.slot_w, self.slot_h)
+        self.browser_placeholder.setGeometry(0, 0, W, H)
         self.browser_placeholder.setStyleSheet(f"background: {THEME['bg']};")
         self.browser_placeholder.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.browser_cover = QWidget(self.browser_placeholder)
-        self.browser_cover.setGeometry(0, 0, self.slot_w, self.slot_h)
+        self.browser_cover.setGeometry(0, 0, W, H)
         self.browser_cover.setStyleSheet(f"background: {THEME['bg']};")
         self.browser_cover.hide()
 
         self._build_chrome_ui()
-        self._build_tray()
 
         self.overlay = LoadingOverlay(self)
         self.overlay_state.connect(self._apply_overlay_state)
@@ -2982,6 +2978,15 @@ class MainWindow(QMainWindow):
         self.btn_prompt.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_prompt.clicked.connect(lambda _checked=False: self._choose_prompt())
         top_layout.addWidget(self.btn_prompt)
+
+        # Режим администратора (pre14): сдвиги объектов страницы из GUI.
+        self.btn_admin = QPushButton("⚙")
+        self.btn_admin.setToolTip("Режим администратора: положение объектов (F8)")
+        self.btn_admin.setStyleSheet(icon_btn)
+        self.btn_admin.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_admin.setVisible(bool(getattr(self, "admin_mode", False)))
+        self.btn_admin.clicked.connect(lambda _checked=False: self._toggle_admin_panel())
+        top_layout.addWidget(self.btn_admin)
 
         btn_restart = QPushButton("⟳")
         btn_restart.setToolTip("Перезапуск")
@@ -3142,21 +3147,6 @@ class MainWindow(QMainWindow):
             except Exception:
                 diag.exception("main.sync_embedded")
 
-    def _zoom(self):
-        """Зум страницы: 2/3 по умолчанию, можно подстроить в config.json.
-
-        `browser_zoom` — единственный «рычаг» размера содержимого: меньше
-        значение -> шире раскладка -> страница целиком влезает в слот (и
-        наоборот). Меняется без пересборки.
-        """
-        try:
-            value = float(self.cfg.get("browser_zoom") or 0)
-        except Exception:
-            value = 0.0
-        if not 0.4 <= value <= 1.0:
-            value = ZOOM
-        return value
-
     def _placeholder_logical_size(self):
         """РЕАЛЬНЫЙ размер плейсхолдера в DIP (Qt работает в DIP).
 
@@ -3208,6 +3198,146 @@ class MainWindow(QMainWindow):
         physical_w, physical_h = self._browser_physical_size()
         return logical_w, logical_h, physical_w, physical_h
 
+    # ─────────────────────────────────────────────────────────────────────── #
+    #  Режим администратора (pre14): положение объектов страницы             #
+    # ─────────────────────────────────────────────────────────────────────── #
+
+    def _admin_enabled(self):
+        """pre14 — измерительная сборка, режим администратора включён."""
+        if "--no-admin" in sys.argv:
+            return False
+        return bool(self.cfg.get("admin_mode", True)) or "--admin" in sys.argv
+
+    def _monitor_scale(self):
+        """Во сколько раз физические пиксели больше логических DIP."""
+        logical_w, logical_h, _physical_w, _physical_h = self._zoom_size()
+        ph_w, _ph_h = self._placeholder_physical_size()
+        return (float(ph_w) / float(logical_w)) if logical_w else 1.0
+
+    def tune_geom(self):
+        """Геометрия для layout_tune: окно браузера, физические px, рамка GUI.
+
+        `_zoom_size` даёт логический размер ПЛЕЙСХОЛДЕРА и физический размер
+        САМОГО окна браузера. Окно может быть сдвинуто и уменьшено ползунками
+        администратора, поэтому его логический размер считается от физического,
+        а рамка — сколько этого окна закрыто панелями приложения.
+        """
+        logical_w, logical_h, physical_w, physical_h = self._zoom_size()
+        scale = self._monitor_scale() or 1.0
+        win_w = int(round(float(physical_w) / scale))
+        win_h = int(round(float(physical_h) / scale))
+        tune = self.tune
+        dx = int(tune.get("win_dx", 0) or 0)
+        dy = int(tune.get("win_dy", 0) or 0)
+        top = int(getattr(self, "top_inset", 0) or 0)
+        bottom = int(getattr(self, "bottom_inset", 0) or 0)
+        side = int(getattr(self, "side_inset", 0) or 0)
+        return {
+            "logical": (win_w, win_h),
+            "physical": (int(physical_w), int(physical_h)),
+            "window": (int(logical_w), int(logical_h)),
+            "gui_top": top,
+            "gui_bottom": bottom,
+            "gui_side": side,
+            # Сколько окна браузера перекрыто панелями приложения.
+            "top": max(0, top - dy),
+            "bottom": max(0, (dy + win_h) - (int(logical_h) - bottom)),
+            "side": max(0, side - dx),
+        }
+
+    def _window_inset(self):
+        """(left, top, right, bottom) окна браузера, физические px плейсхолдера."""
+        logical_w, logical_h, _physical_w, _physical_h = self._zoom_size()
+        scale = self._monitor_scale() or 1.0
+        tune = self.tune
+        dx = int(tune.get("win_dx", 0) or 0)
+        dy = int(tune.get("win_dy", 0) or 0)
+        dw = int(tune.get("win_dw", 0) or 0)
+        dh = int(tune.get("win_dh", 0) or 0)
+        return (int(round(dx * scale)), int(round(dy * scale)),
+                int(round(-(dx + dw) * scale)), int(round(-(dy + dh) * scale)))
+
+    def _apply_window_inset(self):
+        """Сдвинуть/уменьшить окно браузера под ползунки администратора.
+
+        Только Win32 из GUI-потока: SetWindowPos асинхронный, поэтому размер
+        перечитывается с небольшой задержкой (см. `_apply_tune`).
+        """
+        host = getattr(self, "browser_host", None)
+        if host is None or not getattr(self, "native_mode", False):
+            return
+        try:
+            host.inset = self._window_inset()
+            host.sync()
+        except Exception:
+            diag.exception("main.window_inset")
+
+    def current_page(self):
+        """Публичная обёртка над _current_page (её использует панель администратора)."""
+        return self._current_page()
+
+    def apply_tune(self, force=False):
+        """Применить сдвиги администратора (вызывается панелью)."""
+        self._apply_tune(force=force)
+
+    def _apply_tune(self, force=False):
+        """Применить положение объектов: окно (Win32) + страница (CDP)."""
+        if self._closing or not self.native_mode or self._tune_busy:
+            return
+        self._apply_window_inset()
+        # SetWindowPos асинхронный: даём окну осесть, иначе физический размер
+        # прочитается старым и вся раскладка будет посчитана не от того окна.
+        QTimer.singleShot(250, lambda: self._apply_tune_page(force))
+
+    def _apply_tune_page(self, force=False):
+        """Раскладка страницы под сдвиги администратора (фоновый поток)."""
+        if self._closing or not self.native_mode or self._tune_busy:
+            return
+        page = self._current_page()
+        if page is None:
+            return
+        geom = self.tune_geom()
+        tune = self.tune
+
+        def task():
+            self._tune_busy = True
+            try:
+                layout_tune.apply(page, tune, geom, force=force)
+            except Exception:
+                diag.exception("main.apply_tune")
+            finally:
+                self._tune_busy = False
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def save_tune(self):
+        """Сохранить сдвиги в config.json (ключ layout_tune)."""
+        try:
+            self.cfg = layout_tune.save(self.cfg, self.tune)
+            save_config(self.cfg)
+        except Exception:
+            diag.exception("main.save_tune")
+
+    def _toggle_admin_panel(self):
+        """Показать/скрыть панель администратора (кнопка ⚙ или F8)."""
+        if not getattr(self, "admin_mode", False):
+            return
+        try:
+            if self.admin_panel is None:
+                self.admin_panel = AdminPanel(self)
+            if self.admin_panel.isVisible():
+                self.admin_panel.hide()
+            else:
+                self.admin_panel.show()
+                self.admin_panel.raise_()
+                self.admin_panel.activateWindow()
+            diag.event("layout.admin_panel",
+                       visible=bool(self.admin_panel.isVisible()),
+                       values=json.dumps(layout_tune.as_floats(self.tune),
+                                         ensure_ascii=False))
+        except Exception:
+            diag.exception("main.admin_panel")
+
     def _placeholder_physical_size(self):
         """Физический размер плейсхолдера (GetClientRect даёт физические пиксели).
 
@@ -3246,14 +3376,27 @@ class MainWindow(QMainWindow):
             return
         logical_w, logical_h, physical_w, physical_h = self._zoom_size()
 
+        geom = self.tune_geom()
+        tune = self.tune
+
         def guard():
             try:
-                ok, _metrics = zoom_ok(page, logical_w, logical_h, physical_w, physical_h,
-                                        zoom=self._zoom())
-                if ok:
-                    return
-                result = apply_zoom(page, logical_w, logical_h, physical_w, physical_h,
-                                    zoom=self._zoom())
+                if layout_tune.is_default(tune):
+                    # Сдвигов нет: ровно прежний, проверенный на Windows путь v13.
+                    ok, _metrics = zoom_ok(page, logical_w, logical_h, physical_w, physical_h)
+                    if ok:
+                        return
+                    result = apply_zoom(page, logical_w, logical_h, physical_w, physical_h)
+                else:
+                    ok, _metrics = layout_tune.ok(page, tune, geom)
+                    if ok:
+                        # Сдвиги живут в DOM: после перезагрузки страницы их
+                        # нужно вернуть, не трогая зум.
+                        if not layout_tune.injected(page):
+                            layout_tune.inject(page, tune, geom)
+                            diag.event("layout.tune_restored", source="inject")
+                        return
+                    result = layout_tune.apply(page, tune, geom)
                 diag.event("browser.zoom_restored",
                            source=(result or {}).get("source"))
             except Exception:
@@ -3266,12 +3409,16 @@ class MainWindow(QMainWindow):
         try:
             toggle_key = self.cfg.get("hotkey_toggle", "F2")
             mic_key = self.cfg.get("hotkey_mic", "F3")
+            admin_key = str(self.cfg.get("hotkey_admin", ADMIN_HOTKEY) or ADMIN_HOTKEY)
 
             vk_toggle = VK_MAP.get(toggle_key, 0x71)
             vk_mic = VK_MAP.get(mic_key, 0x72)
+            # Режим администратора (pre14): третий опрашиваемый ключ.
+            vk_admin = VK_MAP.get(admin_key, 0) if self.admin_mode else 0
 
             # Опрос работает всегда: ложный статус конфликта невозможен.
-            self._hotkeys_registered = bool(self.hotkeys.set_keys(vk_toggle, vk_mic))
+            self._hotkeys_registered = bool(
+                self.hotkeys.set_keys(vk_toggle, vk_mic, vk_admin))
             try:
                 suppressed = self.hotkeys.try_suppress(int(self.winId() or 0))
             except Exception:
@@ -3280,6 +3427,7 @@ class MainWindow(QMainWindow):
                 "hotkeys.configured",
                 toggle=str(toggle_key),
                 mic=str(mic_key),
+                admin=str(admin_key) if vk_admin else "",
                 suppressed=bool(suppressed),
             )
             return self._hotkeys_registered
@@ -3308,6 +3456,8 @@ class MainWindow(QMainWindow):
             self._toggle_visibility()
         elif key_id == HOTKEY_MIC_ID:
             self._toggle_mic()
+        elif key_id == HOTKEY_ADMIN_ID:
+            self._toggle_admin_panel()
 
     def _change_hotkey(self, cfg_key: str, default: str, caption: str, chip: HotkeyChip, other_cfg_key: str):
         current = self.cfg.get(cfg_key, default)
@@ -3340,89 +3490,6 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot()  # Explicit zero-argument Qt slot: clicked(bool) must not reach @stage.
     @stage
-    # ---------------------------------------------------------------- трей
-    def _app_icon(self):
-        """Иконка приложения: `icon.ico` рядом с программой или нарисованная «L».
-
-        В onefile-сборке файла рядом с EXE может не быть, поэтому иконка
-        рисуется на месте — значок в трее появляется в любом случае.
-        """
-        for folder in (Path(getattr(sys, "argv", [""])[0] or ".").resolve().parent,
-                       Path(__file__).resolve().parent):
-            try:
-                candidate = folder / "icon.ico"
-                if candidate.is_file():
-                    icon = QIcon(str(candidate))
-                    if not icon.isNull():
-                        return icon
-            except Exception:
-                diag.exception("main.icon_file")
-        return self._drawn_icon()
-
-    def _drawn_icon(self, size=64):
-        """Значок «L»: фиолетовый квадрат с белой буквой."""
-        pixmap = QPixmap(size, size)
-        pixmap.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(pixmap)
-        try:
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor("#7c83ff"))
-            painter.drawRoundedRect(0, 0, size, size, size * 0.24, size * 0.24)
-            font = QFont()
-            font.setBold(True)
-            font.setPixelSize(int(size * 0.64))
-            painter.setFont(font)
-            painter.setPen(QColor("#ffffff"))
-            painter.drawText(0, 0, size, size, Qt.AlignmentFlag.AlignCenter, "L")
-        finally:
-            painter.end()
-        return QIcon(pixmap)
-
-    def _build_tray(self):
-        """Значок в трее: показать/скрыть окно и выход из программы.
-
-        Панель задач остаётся чистой (окно браузера оттуда убрано), а
-        приложением можно управлять из трея: один клик — показать/скрыть,
-        правая кнопка — меню с выходом.
-        """
-        try:
-            icon = self._app_icon()
-            try:
-                self.setWindowIcon(icon)
-            except Exception:
-                diag.exception("main.window_icon")
-            self.tray = QSystemTrayIcon(icon, self)
-            self.tray.setToolTip("Legalyze")
-            menu = QMenu()
-            menu.setStyleSheet(
-                "QMenu { background: #171922; color: #e6e8f0; border: 1px solid #2a2f3d; }"
-                "QMenu::item { padding: 6px 22px 6px 14px; }"
-                "QMenu::item:selected { background: #2a2f3d; }"
-            )
-            toggle = menu.addAction("Показать / скрыть   F2")
-            toggle.triggered.connect(lambda _checked=False: self._toggle_visibility())
-            exit_action = menu.addAction("Выход")
-            exit_action.triggered.connect(lambda _checked=False: self._close_app())
-            # QSystemTrayIcon НЕ владеет меню — держим ссылку сами.
-            self.tray_menu = menu
-            self.tray.setContextMenu(menu)
-            self.tray.activated.connect(self._tray_activated)
-            self.tray.show()
-            diag.event("tray.ready", available=bool(self.tray.isSystemTrayAvailable()))
-        except Exception:
-            diag.exception("main.tray")
-
-    def _tray_activated(self, reason):
-        if self._closing:
-            return
-        try:
-            if reason in (QSystemTrayIcon.ActivationReason.Trigger,
-                          QSystemTrayIcon.ActivationReason.DoubleClick):
-                self._toggle_visibility()
-        except Exception:
-            diag.exception("main.tray_activate")
-
     def _toggle_visibility(self):
         if self.isVisible():
             self.hide()
@@ -3740,12 +3807,10 @@ class MainWindow(QMainWindow):
         self._set_status("Ожидание страницы ИИ…", THEME["muted"])
 
         # Штатный микрофон страницы живёт только в настоящем браузере.
-        # Окно браузера создаётся сразу размером со слот: после встраивания
-        # его не нужно «дотягивать» — нет ни скачка, ни сдвига содержимого.
-        slot_w, slot_h = self._placeholder_logical_size()
         host = NativeHost(self, url=URL, profile=BROWSER_PROFILE,
-                          width=slot_w, height=slot_h,
+                          width=W, height=H,
                           configured=(self.cfg.get("browser_path") or None))
+        host.inset = self._window_inset()
         host.ready.connect(self._on_browser_ready)
         host.failed.connect(self._on_browser_failed)
         self.browser_host = host
@@ -3779,6 +3844,10 @@ class MainWindow(QMainWindow):
             self.zoom_timer = QTimer(self)
             self.zoom_timer.timeout.connect(self._ensure_zoom)
         self.zoom_timer.start(5000)
+        # Сохранённые сдвиги администратора применяются сразу; при значениях
+        # по умолчанию страница не трогается вообще.
+        if not layout_tune.is_default(self.tune):
+            QTimer.singleShot(1800, self._apply_tune)
 
     @pyqtSlot(str)
     @stage
@@ -3950,7 +4019,7 @@ class MainWindow(QMainWindow):
         self._chat_ready = False
         self.worker = ChromeWorker(self, port=getattr(self, "cdp_port", DEBUG_PORT),
                                   native=self.native_mode, size=self._zoom_size(),
-                                  zoom=self._zoom())
+                                  tune=self.tune, geom=self.tune_geom())
         self.worker.hwnd_ready.connect(self._on_hwnd)
         self.worker.failed.connect(self._on_failed)
         self.worker.start()
@@ -4348,14 +4417,17 @@ class MainWindow(QMainWindow):
         self.upload_deadline_timer.stop()
         self.response_end_timer.stop()
         self.topmost_timer.stop()
-        try:
-            if getattr(self, "tray", None) is not None:
-                self.tray.hide()
-        except Exception:
-            diag.exception("main.tray_hide")
         if getattr(self, "zoom_timer", None) is not None:
             self.zoom_timer.stop()
         self.chrome_hwnd = None
+        try:
+            panel = getattr(self, "admin_panel", None)
+            if panel is not None:
+                panel.close()
+                panel.deleteLater()
+                self.admin_panel = None
+        except Exception:
+            diag.exception("main.admin_panel_cleanup")
 
         try:
             self.overlay.finish()

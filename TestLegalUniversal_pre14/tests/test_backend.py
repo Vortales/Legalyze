@@ -21,6 +21,7 @@ ORIGINAL = ROOT.parent / 'TestLegal'
 sys.path.insert(0, str(ROOT))
 
 import native_browser  # noqa: E402
+import layout_tune  # noqa: E402
 import speech_backend  # noqa: E402
 import win32_embed  # noqa: E402
 import win32_hotkeys  # noqa: E402
@@ -98,43 +99,6 @@ class ZoomedCDPPage(FakeCDPPage):
         return {}
 
 
-class FitCDPPage(FakeCDPPage):
-    """Страница сайта с минимальной шириной раскладки и полем ввода в потоке.
-
-    `min_width` — во столько CSS px сайт верстает страницу (если окно уже,
-    содержимое не влезает и «съезжает вправо»); `input_bottom` — абсолютная
-    позиция низа поля ввода (если она ниже видимой части, «окно запроса
-    улетело вниз»).
-    """
-
-    def __init__(self, min_width=620, input_bottom=0, start=(620, 977),
-                 dpr=1.0, window_w=620):
-        super().__init__({"w": start[0], "h": start[1], "dpr": dpr,
-                          "sw": max(min_width, start[0])}, window_w)
-        self.min_width = int(min_width)
-        self.input_bottom = int(input_bottom)
-
-    def send(self, method, params=None, timeout=None):
-        params = dict(params or {})
-        self.calls.append((method, params))
-        if method == 'Emulation.setDeviceMetricsOverride':
-            width = int(params.get('width') or 0)
-            dsf = float(params.get('deviceScaleFactor') or 1.0)
-            self.metrics = {"w": width, "h": int(params.get('height') or 0),
-                            "dpr": dsf, "sw": max(self.min_width, width)}
-        return {}
-
-    def eval(self, expression, timeout=None):
-        import json
-        w = int(self.metrics.get("w") or 0)
-        h = int(self.metrics.get("h") or 0)
-        if 'contenteditable' in (expression or ''):
-            return {'value': json.dumps({"iw": w, "ih": h,
-                                         "sw": max(self.min_width, w),
-                                         "ib": self.input_bottom})}
-        return {'value': json.dumps(self.metrics)}
-
-
 class FakeUser32:
     """user32, у которого SetParent не срабатывает (худший случай)."""
 
@@ -199,10 +163,6 @@ skip_node = unittest.skipUnless(NODE, 'Node unavailable')
 
 
 class SourceTests(unittest.TestCase):
-    def setUp(self):
-        # Подгонка запоминает ширину раскладки — между тестами её быть не должно.
-        native_browser._FIT.update({"key": None, "css_w": None})
-
     def test_compile(self):
         for p in ROOT.glob('*.py'):
             compile(p.read_text(), str(p), 'exec')
@@ -549,7 +509,8 @@ class SourceTests(unittest.TestCase):
         modules = ['main.py', 'native_browser.py', 'win32_embed.py', 'browser_focus.py',
                    'web_compat.py', 'qt_browser.py', 'speech_backend.py', 'diagnostics.py',
                    'config.py', 'storage_paths.py', 'updater.py', 'crypto_utils.py',
-                   'hwid_gen.py', 'secure_store.py', 'win32_hotkeys.py', 'smoke_browser.py']
+                   'hwid_gen.py', 'secure_store.py', 'win32_hotkeys.py', 'smoke_browser.py',
+                   'layout_tune.py', 'layout_tune_ui.py']
         extra_globals = {'__file__', '__name__', '__doc__', '__package__', '__spec__',
                          '__loader__', '__builtins__', '__debug__', '__path__'}
         problems = []
@@ -951,172 +912,275 @@ class SourceTests(unittest.TestCase):
         self.assertNotIn('restart', guard)
         self.assertIn('apply_zoom(page', guard)
 
-    # ---------------------------------------------------------------- v14 --
-    def test_browser_lives_inside_the_frame_not_under_it(self):
-        # Панель сверху (54 px) срезала верх страницы, нижняя (30 px) — поле
-        # ввода: плейсхолдер занимал всё окно. Теперь он ровно в видимом слоте.
-        tree = ast.parse((ROOT / 'main.py').read_text())
-        window = next(n for n in tree.body if isinstance(n, ast.ClassDef)
-                      and n.name == 'MainWindow')
-        methods = {m.name: m for m in window.body if isinstance(m, ast.FunctionDef)}
-        body = ast.unparse(methods['__init__'])
-        self.assertIn('self.slot_w = int(W - 2 * self.side_inset)', body)
-        self.assertIn('self.slot_h = int(H - self.top_inset - self.bottom_inset)', body)
-        self.assertIn('self.browser_placeholder.setGeometry(self.side_inset, '
-                      'self.top_inset, self.slot_w, self.slot_h)', body)
-        self.assertIn('self.browser_cover.setGeometry(0, 0, self.slot_w, self.slot_h)', body)
-        self.assertNotIn('self.browser_placeholder.setGeometry(0, 0, W, H)', body)
-        # Окно браузера создаётся сразу размером со слот — без «дотягивания».
-        start = next(m for m in methods.values() if m.name == '_start_chrome')
-        self.assertIn('width=slot_w, height=slot_h', ast.unparse(start))
-
-    def test_layout_is_refined_by_measurement_when_the_page_overflows(self):
-        # Сайт верстает 700 CSS px, окно даёт 620: содержимое не влезает и
-        # «съезжает вправо». Подгонка расширяет раскладку до полного влезания.
-        page = FitCDPPage(min_width=700, input_bottom=900)
-        ok, css_w, metrics = native_browser.refine_fit(page, 413, 651, 620, 977,
-                                                       settle=0)
-        self.assertTrue(ok)
-        self.assertGreaterEqual(css_w, 700)          # страница влезла целиком
-        self.assertEqual(int(metrics['scrollWidth']), int(metrics['innerWidth']))
-        # Поверхность осталась равной окну: ничего не обрезано и не растянуто.
-        dsf = 620.0 / css_w
-        self.assertAlmostEqual(css_w * dsf, 620, delta=1.0)
-        # Запомненная ширина: сторож зума не возвращает раскладку назад.
-        self.assertEqual(native_browser.target_css(413, 651, 620, 977)[0], css_w)
-
-    def test_layout_is_raised_when_the_input_field_is_below_the_fold(self):
-        # «Окно для запросов ИИ улетело вниз»: низ поля ввода (1200) ниже
-        # видимой части (977). Раскладка растёт — поле поднимается в кадр.
-        page = FitCDPPage(min_width=620, input_bottom=1200)
-        ok, css_w, metrics = native_browser.refine_fit(page, 413, 651, 620, 977,
-                                                       settle=0)
-        self.assertTrue(ok)
-        self.assertGreater(css_w, 620)
-        self.assertLessEqual(int(metrics['inputBottom']), int(metrics['innerHeight']))
-
-    def test_nothing_changes_when_the_page_already_fits(self):
-        page = FitCDPPage(min_width=600, input_bottom=500)
-        calls_before = len(page.calls)
-        ok, css_w, _metrics = native_browser.refine_fit(page, 413, 651, 620, 977,
-                                                        settle=0)
-        self.assertTrue(ok)
-        self.assertEqual(css_w, 620)
-        self.assertEqual(len(page.calls), calls_before)   # лишний раз не трогаем
-
-    def test_refinement_never_grows_without_a_limit(self):
-        # Сайт «бесконечной» ширины: подгонка останавливается на пределе.
-        page = FitCDPPage(min_width=100000, input_bottom=0)
-        ok, css_w, _metrics = native_browser.refine_fit(page, 413, 651, 620, 977,
-                                                        settle=0, limit=1.3)
-        self.assertFalse(ok)
-        self.assertLessEqual(css_w, int(620 * 1.3) + 1)
-
-    def test_tray_icon_with_the_L_letter_and_quit_from_the_tray(self):
-        tree = ast.parse((ROOT / 'main.py').read_text())
-        window = next(n for n in tree.body if isinstance(n, ast.ClassDef)
-                      and n.name == 'MainWindow')
-        methods = {m.name: m for m in window.body if isinstance(m, ast.FunctionDef)}
-        self.assertIn('_build_tray', methods)
-        self.assertIn('self._build_tray()', ast.unparse(methods['__init__']))
-        tray = ast.unparse(methods['_build_tray'])
-        self.assertIn('QSystemTrayIcon(icon, self)', tray)
-        self.assertIn('self.tray.setContextMenu(menu)', tray)
-        self.assertIn('self._close_app()', tray)      # выход через трей
-        self.assertIn('self._toggle_visibility()', tray)
-        self.assertIn('self.tray.show()', tray)
-        # Иконка: файл icon.ico рядом с программой, иначе рисуется буква «L».
-        icon = ast.unparse(methods['_app_icon'])
-        self.assertIn('icon.ico', icon)
-        self.assertIn('_drawn_icon()', icon)
-        self.assertIn(", 'L')", ast.unparse(methods['_drawn_icon']))
-        # Клик по значку переключает окно, при выходе значок убирается.
-        self.assertIn('_toggle_visibility()', ast.unparse(methods['_tray_activated']))
-        self.assertIn('self.tray.hide()', ast.unparse(methods['_cleanup']))
-
-    def test_browser_window_is_kept_out_of_the_taskbar(self):
-        # Значок «G» в панели задач: стиль + явный DeleteTab у оболочки.
-        style = {"value": win32_embed.WS_EX_APPWINDOW}
-        moved = []
-
-        class FakeUser32Taskbar:
-            def GetWindowLongPtrW(self, hwnd, index):
-                return style["value"]
-
-            def SetWindowLongPtrW(self, hwnd, index, value):
-                # set_window_long передаёт ctypes.c_void_p
-                style["value"] = int(getattr(value, 'value', value) or 0)
-                return 1
-
-            def SetWindowPos(self, *args):
-                moved.append(args[0])
-                return 1
-
-        deleted = []
-        with patch.object(win32_embed, 'taskbar_delete_tab',
-                          lambda hwnd: deleted.append(hwnd) or True):
-            ok = win32_embed.hide_from_taskbar(FakeUser32Taskbar(), 4242)
-        self.assertTrue(ok)
-        self.assertEqual(deleted, [4242])
-        self.assertEqual(style["value"] & win32_embed.WS_EX_TOOLWINDOW,
-                         win32_embed.WS_EX_TOOLWINDOW)
-        self.assertEqual(style["value"] & win32_embed.WS_EX_APPWINDOW, 0)
-        self.assertEqual(moved, [4242])
-        # Все окна браузера, а не только встроенное.
-        with patch.object(win32_embed, '_windows_of',
-                          lambda user32, pids: [{'hwnd': 11}, {'hwnd': 12}]), \
-                patch.object(win32_embed, 'process_tree', lambda pids: set(pids)), \
-                patch.object(win32_embed, 'hide_from_taskbar',
-                             lambda user32, hwnd: True):
-            result = win32_embed.hide_browser_from_taskbar(object(), {7})
-        self.assertEqual(result, [11, 12])
-        # GUI вызывает это при встраивании и ещё дважды позже (Chrome может
-        # вернуть кнопку после смены заголовка).
-        tree = ast.parse((ROOT / 'main.py').read_text())
-        host = next(n for n in tree.body if isinstance(n, ast.ClassDef)
-                    and n.name == 'NativeHost')
-        methods = {m.name: m for m in host.body if isinstance(m, ast.FunctionDef)}
-        self.assertIn('hide_taskbar', methods)
-        self.assertIn('hide_browser_from_taskbar(self.user32, self.pids)',
-                      ast.unparse(methods['hide_taskbar']))
-        embed = ast.unparse(methods['_embed'])
-        self.assertIn('self.hide_taskbar()', embed)
-        self.assertIn('QTimer.singleShot(1200, self.hide_taskbar)', embed)
-        self.assertIn('QTimer.singleShot(4000, self.hide_taskbar)', embed)
-
-    def test_zoom_can_be_tuned_from_config_without_a_rebuild(self):
-        tree = ast.parse((ROOT / 'main.py').read_text())
-        window = next(n for n in tree.body if isinstance(n, ast.ClassDef)
-                      and n.name == 'MainWindow')
-        methods = {m.name: m for m in window.body if isinstance(m, ast.FunctionDef)}
-        code = ast.get_source_segment((ROOT / 'main.py').read_text(), methods['_zoom'])
-        namespace = {'ZOOM': 2.0 / 3.0, 'float': float}
-        exec(compile(code, '<_zoom>', 'exec'), namespace)
-        zoom = namespace['_zoom']
-
-        class Cfg:
-            def __init__(self, value):
-                self.value = value
-
-            def get(self, key, default=None):
-                return self.value
-
-        self.assertAlmostEqual(zoom(SimpleNamespace(cfg=Cfg(0.62))), 0.62, delta=1e-9)
-        self.assertAlmostEqual(zoom(SimpleNamespace(cfg=Cfg(None))), 2.0 / 3.0, delta=1e-9)
-        self.assertAlmostEqual(zoom(SimpleNamespace(cfg=Cfg('nonsense'))),
-                               2.0 / 3.0, delta=1e-9)   # вне диапазона ->默认值
-        self.assertAlmostEqual(zoom(SimpleNamespace(cfg=Cfg(5))), 2.0 / 3.0, delta=1e-9)
-        # Значение доходит и до сторожа зума, и до рабочего потока.
-        guard = ast.unparse(methods['_ensure_zoom'])
-        self.assertIn('zoom=self._zoom()', guard)
-        automation = ast.unparse(methods['_start_web_automation'])
-        self.assertIn('zoom=self._zoom()', automation)
-
     def test_zoom_restored_to_native_67(self):
         source = (ROOT / 'qt_browser.py').read_text()
         self.assertIn('ZOOM_FACTOR = 2.0 / 3.0', source)
         self.assertIn('setZoomFactor(ZOOM_FACTOR)', source)
         self.assertIn('JS_PURGE', source)  # early purge: no flash of site chrome
+
+
+class TuneCDPPage:
+    """Страница CDP для layout_tune: метрики окна + прямоугольник поля ввода.
+
+    Моделирует ровно дефект v13: поле ввода приклеено к НИЖНЕЙ кромке
+    раскладки, то есть стоит там, где заканчивается `innerHeight`. Чем больше
+    `innerHeight`, тем ниже поле — и тем сильнее оно уезжает под нижнюю панель.
+    """
+
+    def __init__(self, w=680, h=1102, dpr=2 / 3, sw=None, margin=20):
+        self.calls = []
+        self.w = int(w)
+        self.h = int(h)
+        self.dpr = float(dpr)
+        self.sw = int(sw if sw is not None else w)
+        self.margin = int(margin)
+        self.injected = False
+        self.payloads = []
+
+    def send(self, method, params=None, timeout=None):
+        params = dict(params or {})
+        self.calls.append((method, params))
+        if method == 'Emulation.setDeviceMetricsOverride':
+            self.w = int(params.get('width') or 0)
+            self.h = int(params.get('height') or 0)
+            self.dpr = float(params.get('deviceScaleFactor') or 1.0)
+            self.sw = self.w
+        return {}
+
+    def eval(self, expression, timeout=None):
+        if '!!document' in expression:
+            return {'value': json.dumps(bool(self.injected))}
+        if 'iw:' in expression:
+            bottom = max(0, self.h - self.margin)
+            rect = {'l': 30, 't': max(0, bottom - 40), 'r': max(31, self.w - 30),
+                    'b': bottom, 'w': max(1, self.w - 60), 'h': 40}
+            return {'value': json.dumps({
+                'iw': self.w, 'ih': self.h, 'dpr': self.dpr,
+                'sw': self.sw, 'sh': self.h, 'sx': 0, 'sy': 0,
+                'found': 1, 'sel': 'div[contenteditable]', 'rect': rect,
+                'url': 'https://google.com/ai'})}
+        self.injected = True
+        self.payloads.append(expression)
+        return {'value': json.dumps({'ok': 1, 'rules': 0})}
+
+
+class SyncUser32:
+    """user32, у которого можно проверить куда и каким поставлено окно."""
+
+    def __init__(self, client=(453, 735)):
+        self.client = client
+        self.moves = []
+
+    def GetClientRect(self, hwnd, rect):
+        # ctypes.byref() передаёт обёртку: настоящая структура в `_obj`.
+        box = getattr(rect, "_obj", rect)
+        box.left = 0
+        box.top = 0
+        box.right = self.client[0]
+        box.bottom = self.client[1]
+        return 1
+
+    def SetWindowPos(self, hwnd, after, x, y, w, h, flags):
+        self.moves.append((int(x), int(y), int(w), int(h)))
+        return 1
+
+
+class DualCDPPage(TuneCDPPage):
+    """Отдаёт оба формата: `iw/ih` (layout_tune) и `w/h` (native_browser)."""
+
+    def eval(self, expression, timeout=None):
+        if 'iw:' in expression or '!!document' in expression:
+            return super().eval(expression, timeout)
+        return {'value': json.dumps({'w': self.w, 'h': self.h,
+                                     'dpr': self.dpr, 'sw': self.sw})}
+
+
+GEOM = {"logical": (453, 735), "physical": (453, 735),
+        "top": 54, "bottom": 30, "side": 20}
+
+
+class LayoutTuneTests(unittest.TestCase):
+    """pre14: режим администратора — сдвиги объектов страницы по ИЗМЕРЕНИЮ.
+
+    Главная гарантия: пока сдвиги не заданы, сборка обязана вести себя как
+    v13 («полностью рабочая»). Поэтому каждое решение здесь сравнивается с
+    уже проверенным на Windows `native_browser.zoom_ok`.
+    """
+
+    def test_default_tune_means_the_v13_layout(self):
+        self.assertTrue(layout_tune.is_default(layout_tune.DEFAULTS))
+        self.assertTrue(layout_tune.is_default(layout_tune.normalize({})))
+        self.assertFalse(layout_tune.is_default(
+            layout_tune.normalize({"height_delta": -10})))
+        self.assertFalse(layout_tune.is_default(layout_tune.normalize({"frame": 1})))
+        # Масштаб по умолчанию — нативные 67 % из v13.
+        self.assertAlmostEqual(layout_tune.zoom_of(layout_tune.DEFAULTS), 2 / 3, delta=0.001)
+
+    def test_default_tune_answers_like_the_v13_zoom_check(self):
+        # Регрессия: пока сдвигов нет, решение «трогать страницу или нет»
+        # обязано совпадать с проверенным на Windows native_browser.zoom_ok.
+        cases = [
+            (680, 1102, 2 / 3, 680),     # зум профиля 67 % — всё верно
+            (453, 735, 1.0, 453),        # зума нет — «широкая раскладка» v8
+            (680, 1102, 1.0, 680),       # зум есть, но отрисовка не сжата
+            (566, 919, 0.8333, 566),     # масштаб 125 %
+        ]
+        for w, h, dpr, sw in cases:
+            page = DualCDPPage(w=w, h=h, dpr=dpr, sw=sw)
+            mine, _m1 = layout_tune.ok(page, layout_tune.DEFAULTS, GEOM)
+            theirs, _m2 = native_browser.zoom_ok(page, 453, 735, 453, 735)
+            self.assertEqual(bool(mine), bool(theirs), (w, h, dpr))
+
+    def test_default_tune_leaves_the_native_zoom_alone(self):
+        # 680x1102 при dpr 2/3 — это ровно то, что даёт профиль v13: ничего
+        # переопределять нельзя, иначе нативный зум 67 % будет испорчен.
+        page = TuneCDPPage(680, 1102, 2 / 3)
+        result = layout_tune.apply(page, layout_tune.DEFAULTS, GEOM)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["source"], "native")
+        self.assertEqual([method for method, _p in page.calls], [])
+
+    def test_the_drop_of_the_input_field_is_measured_in_dip(self):
+        page = TuneCDPPage(680, 1102, 2 / 3)
+        measured = layout_tune.measure(page, layout_tune.DEFAULTS, GEOM)
+        self.assertEqual(measured["inner"]["w"], 680)
+        self.assertEqual(measured["visible_dip"]["bottom"], 735 - 30)
+        # Дефект v13 виден ЧИСЛОМ: низ поля на 16 DIP ниже видимой области.
+        self.assertGreater(measured["below_dip"], 0)
+        self.assertEqual(measured["input"]["found"], 1)
+
+    def test_height_delta_lifts_the_input_field_into_view(self):
+        page = TuneCDPPage(680, 1102, 2 / 3)
+        before = layout_tune.measure(page, layout_tune.DEFAULTS, GEOM)
+        tune = layout_tune.normalize({"height_delta": -127})
+        result = layout_tune.apply(page, tune, GEOM, settle=0)
+        self.assertTrue(result["ok"])
+        after = result["measure"]
+        self.assertLess(after["below_dip"], 0)
+        self.assertLess(after["below_dip"], before["below_dip"])
+        # Меняется ТОЛЬКО высота: ширина осталась шириной v13.
+        base_w, base_h, _dsf, _zoom = layout_tune.target(
+            GEOM["logical"], GEOM["physical"], layout_tune.DEFAULTS)
+        self.assertEqual(page.calls[0][1]["width"], base_w)
+        self.assertLess(page.calls[0][1]["height"], base_h)
+
+    def test_auto_fill_puts_the_browser_window_into_the_visible_slot(self):
+        tune = layout_tune.auto_fill(GEOM, layout_tune.DEFAULTS)
+        # Окно браузера становится 413x651 DIP в точке (20, 54) — ровно слот.
+        self.assertEqual(layout_tune.window_rect(GEOM, tune), (20, 54, 413, 651))
+        # Раз окно == слот, внутри него уже ничего подгонять не нужно.
+        self.assertEqual(tune["width_delta"], 0)
+        self.assertEqual(tune["height_delta"], 0)
+        # Раскладка равна клиентской области окна: пустых полос нет.
+        geom2 = dict(GEOM, logical=(413, 651), physical=(413, 651),
+                     top=0, bottom=0, side=0)
+        css_w, css_h, dsf, zoom = layout_tune.target(geom2["logical"],
+                                                     geom2["physical"], tune)
+        self.assertAlmostEqual(css_w * dsf, 413, delta=1)
+        self.assertAlmostEqual(css_h * dsf, 651, delta=1)
+        self.assertAlmostEqual(zoom, 2 / 3, delta=0.001)
+
+    def test_shrinking_the_window_lifts_the_input_field_without_blank_strips(self):
+        page = TuneCDPPage(680, 1102, 2 / 3)
+        before = layout_tune.measure(page, layout_tune.DEFAULTS, GEOM)
+        self.assertGreater(before["below_dip"], 0)          # дефект v13
+        # Окно = видимый слот: 413x651 физических px, раскладка 619x976 CSS.
+        geom2 = dict(GEOM, logical=(413, 651), physical=(413, 651),
+                     top=0, bottom=0, side=0)
+        page2 = TuneCDPPage(619, 976, 413 / 619)
+        result = layout_tune.apply(page2, layout_tune.DEFAULTS, geom2, settle=0)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["source"], "native")   # зум не сломан
+        after = result["measure"]
+        self.assertLessEqual(after["below_dip"], 0)    # поле внутри окна
+        # Поверхность ровно равна окну -> незакрашенных полос нет.
+        self.assertAlmostEqual(after["inner"]["w"] * after["inner"]["dpr"], 413, delta=1)
+        self.assertAlmostEqual(after["inner"]["h"] * after["inner"]["dpr"], 651, delta=1)
+
+    def test_the_browser_window_is_itself_a_tunable_object(self):
+        """pre14: окном браузера управляют ползунки — это и лечит «уехало вниз»."""
+        user32 = SyncUser32((453, 735))
+        self.assertTrue(win32_embed.sync(user32, 11, 22))
+        self.assertEqual(user32.moves[-1], (0, 0, 453, 735))     # как в v13
+        # (20, 54, 20, 30) = панели GUI: сверху 54, снизу 30, по бокам 20.
+        self.assertTrue(win32_embed.sync(user32, 11, 22, (20, 54, 20, 30)))
+        self.assertEqual(user32.moves[-1], (20, 54, 413, 651))   # ровно слот
+        # Невозможный inset не вызывает SetWindowPos: окно остаётся прежним.
+        before = len(user32.moves)
+        self.assertFalse(win32_embed.sync(user32, 11, 22, (400, 700, 400, 700)))
+        self.assertEqual(len(user32.moves), before)
+
+    def test_report_carries_the_numbers_and_the_verdict(self):
+        page = TuneCDPPage(680, 1102, 2 / 3)
+        tune = layout_tune.normalize({"height_delta": -127, "input_dy": -8})
+        text = layout_tune.report(tune, layout_tune.measure(page, tune, GEOM), GEOM)
+        self.assertIn("height_delta=-127", text)
+        self.assertIn("input_dy=-8", text)
+        self.assertIn('"height_delta": -127', text)
+        self.assertIn("ниже видимой нижней кромки", text)
+        self.assertIn("Видимая область (DIP): x 20..433, y 54..705", text)
+
+    def test_shifts_never_restart_the_browser(self):
+        # Эскалация зума перезапуском ломала GUI в v10/v11 — здесь её нет.
+        source = (ROOT / 'layout_tune.py').read_text()
+        self.assertIn('Emulation.setDeviceMetricsOverride', source)
+        self.assertNotIn('subprocess', source)
+        self.assertNotIn('restart', source)
+        self.assertNotIn('keybd', source)
+
+    def test_admin_mode_is_wired_without_replacing_the_v13_zoom_path(self):
+        source = (ROOT / 'main.py').read_text()
+        tree = ast.parse(source)
+        window = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                      and n.name == 'MainWindow')
+        methods = {m.name: m for m in window.body if isinstance(m, ast.FunctionDef)}
+        for name in ('_toggle_admin_panel', 'tune_geom', '_apply_tune', 'save_tune'):
+            self.assertIn(name, methods, name)
+        self.assertIn('AdminPanel', source)
+        self.assertIn('HOTKEY_ADMIN_ID', source)
+        # Сдвигов нет -> прежний путь v13; сдвиги есть -> измерительный.
+        guard = ast.unparse(methods['_ensure_zoom'])
+        self.assertIn('layout_tune.is_default(tune)', guard)
+        self.assertIn('zoom_ok(page', guard)
+        self.assertIn('apply_zoom(page', guard)
+        self.assertIn('layout_tune.apply(page', guard)
+        # Панель не может заблокировать GUI: раскладка применяется в потоке.
+        self.assertIn('daemon=True', ast.unparse(methods['_apply_tune_page']))
+        # Окно браузера двигается из GUI-потока, а страница — через CDP.
+        self.assertIn('_apply_window_inset', ast.unparse(methods['_apply_tune']))
+        self.assertIn('layout_tune.apply(page', ast.unparse(methods['_apply_tune_page']))
+
+    def test_admin_panel_builds_every_knob_and_reports(self):
+        source = (ROOT / 'layout_tune_ui.py').read_text()
+        tree = ast.parse(source)
+        panel = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                     and n.name == 'AdminPanel')
+        methods = {m.name: m for m in panel.body if isinstance(m, ast.FunctionDef)}
+        for name in ('collect', 'sync_from', '_push', '_auto', '_measure',
+                     '_report', '_copy', '_write_result', '_reset', '_save'):
+            self.assertIn(name, methods, name)
+        # Ползунки строятся из SPEC: ни один ключ не забыт.
+        self.assertIn('for row in layout_tune.SPEC', ast.unparse(methods['__init__']))
+        self.assertIn('layout_tune.report(', ast.unparse(methods['_report']))
+        self.assertIn('layout_tune.measure(', ast.unparse(methods['_measure']))
+        self.assertIn('layout_tune.auto_fill(', ast.unparse(methods['_auto']))
+        # Результаты попадают и в буфер обмена, и в файл: буфер может быть занят.
+        self.assertIn('layout_tune_result.txt', source)
+        self.assertIn('QApplication.clipboard()', source)
+        # Никакой блокировки GUI: замер идёт в отдельном потоке.
+        self.assertIn('threading.Thread', source)
+        self.assertIn('daemon=True', source)
+
+    def test_admin_hotkey_is_the_third_polled_key(self):
+        fired = []
+        monitor = win32_hotkeys.HotkeyMonitor(on_event=fired.append)
+        monitor.set_keys(0x71, 0x72, 0x77)
+        self.assertEqual(monitor.keys[win32_hotkeys.ID_ADMIN], 0x77)
+        monitor.set_keys(0x71, 0x72)
+        self.assertNotIn(win32_hotkeys.ID_ADMIN, monitor.keys)
+        # Без третьего ключа поведение v13 не меняется вообще.
+        self.assertEqual(sorted(monitor.keys), [win32_hotkeys.ID_TOGGLE_VISIBILITY,
+                                                win32_hotkeys.ID_MIC])
 
 
 class SpeechBackendTests(unittest.TestCase):
@@ -1393,6 +1457,91 @@ class JavascriptTests(unittest.TestCase):
         res = subprocess.run([NODE, '-e', script], capture_output=True, text=True, timeout=60)
         if res.returncode != 0:
             self.fail('node failed: ' + res.stderr[-2000:])
+
+
+    def test_layout_tune_js_measures_and_shifts(self):
+        # JS режима администратора исполняется ВНУТРИ страницы: замер и сдвиги
+        # обязаны работать на реальном DOM, а не только «выглядеть правильно».
+        payload = {"offset_x": 0, "offset_y": -40, "input_dx": 4, "input_dy": 0,
+                   "pad_bottom": 120, "scroll_x": 0, "scroll_y": 90,
+                   "selector": 'div[contenteditable="true"]',
+                   "frame": 1, "fx": 30, "fy": 81, "fw": 620, "fh": 976}
+        off = dict(payload, offset_y=0, frame=0, pad_bottom=0, input_dx=0)
+        script = ("""
+const vm = require('vm');
+const PROBE = PROBE_SRC;
+const TUNE = TUNE_SRC;
+const TUNE_OFF = TUNE_OFF_SRC;
+const rect = {left: 30, top: 1062, right: 650, bottom: 1102, width: 620, height: 40};
+const store = {};
+function place(parent, el) { el.parentNode = parent; store[el.id] = el; return el; }
+function node() {
+  const self = {
+    id: '', tagName: 'div', style: {}, textContent: '', parentNode: null,
+    setAttribute: function () {}, getAttribute: function () { return null; },
+    appendChild: function (el) { return place(self, el); },
+    removeChild: function (el) { delete store[el.id]; el.parentNode = null; }
+  };
+  return self;
+}
+const head = node(), bodyEl = node(), root = node();
+const input = {
+  tagName: 'div', id: 'composer',
+  getAttribute: function (k) { return k === 'contenteditable' ? 'true' : null; },
+  getBoundingClientRect: function () { return rect; }
+};
+const doc = {
+  documentElement: {scrollWidth: 680, scrollHeight: 1102, appendChild: root.appendChild},
+  head: head, body: bodyEl,
+  createElement: function (tag) { const el = node(); el.tagName = tag; return el; },
+  getElementById: function (id) { return store[id] || null; },
+  querySelectorAll: function (sel) {
+    return sel.indexOf('contenteditable') >= 0 ? [input] : [];
+  }
+};
+const sandbox = {
+  window: {innerWidth: 680, innerHeight: 1102, devicePixelRatio: 2 / 3,
+           scrollX: 0, scrollY: 0,
+           scrollTo: function (x, y) { sandbox.window.scrollX = x; sandbox.window.scrollY = y; }},
+  innerWidth: 680, innerHeight: 1102, devicePixelRatio: 2 / 3,
+  JSON: JSON, location: {href: 'https://google.com/ai'}, document: doc
+};
+vm.createContext(sandbox);
+const probe = JSON.parse(vm.runInContext(PROBE, sandbox));
+if (probe.iw !== 680 || probe.ih !== 1102) throw Error('probe viewport ' + JSON.stringify(probe));
+if (probe.found !== 1) throw Error('input not found ' + JSON.stringify(probe));
+if (probe.rect.b !== 1102) throw Error('probe rect ' + JSON.stringify(probe.rect));
+if (probe.sel.indexOf('contenteditable') < 0) throw Error('probe sel ' + probe.sel);
+
+vm.runInContext(TUNE, sandbox);
+const css = store['legalyze-tune-css'];
+if (!css) throw Error('style not injected');
+if (css.textContent.indexOf('translate(0px,-40px)') < 0) throw Error('offset_y ' + css.textContent);
+if (css.textContent.indexOf('padding-bottom:120px') < 0) throw Error('pad_bottom ' + css.textContent);
+if (css.textContent.indexOf('translate(4px,0px)') < 0) throw Error('input_dx ' + css.textContent);
+const frame = store['legalyze-tune-frame'];
+if (!frame) throw Error('frame not injected');
+if (frame.style.left !== '30px' || frame.style.top !== '81px') {
+  throw Error('frame ' + JSON.stringify(frame.style));
+}
+if (frame.style.width !== '620px' || frame.style.height !== '976px') {
+  throw Error('frame size ' + JSON.stringify(frame.style));
+}
+if (sandbox.window.scrollY !== 90) throw Error('scroll ' + sandbox.window.scrollY);
+
+// Выключение: те же элементы переиспользуются, а не плодятся.
+vm.runInContext(TUNE_OFF, sandbox);
+if (store['legalyze-tune-frame']) throw Error('frame must be removed');
+if (store['legalyze-tune-css'].textContent.indexOf('translate') >= 0) {
+  throw Error('style must be cleared');
+}
+if (Object.keys(store).length !== 1) throw Error('leftovers ' + Object.keys(store));
+console.log('layout-tune js ok');
+"""
+                  ).replace('PROBE_SRC', json.dumps(layout_tune.probe_js())) \
+                  .replace('TUNE_SRC', json.dumps(layout_tune.tune_js(payload))) \
+                  .replace('TUNE_OFF_SRC', json.dumps(layout_tune.tune_js(off)))
+        self.run_node(script)
 
     def test_ready_script_gate(self):
         script = literal('READY_SCRIPT', 'qt_browser.py')

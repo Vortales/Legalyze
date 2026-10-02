@@ -64,8 +64,6 @@ SWP_NOACTIVATE = 0x0010
 SWP_SHOWWINDOW = 0x0040
 SWP_FRAMECHANGED = 0x0020
 SWP_ASYNCWINDOWPOS = 0x4000
-SWP_NOSIZE = 0x0001
-SWP_NOMOVE = 0x0002
 
 BROWSER_WINDOW_CLASS = "Chrome_WidgetWin_1"
 try:  # WINFUNCTYPE exists only on Windows; the module must still import
@@ -357,148 +355,34 @@ def embed(user32, hwnd, parent):
         return False
 
 
-def sync(user32, hwnd, parent):
-    """Keep the child exactly over the placeholder, in the placeholder's own
-    client coordinates (child windows are never DPI-virtualised)."""
+def sync(user32, hwnd, parent, inset=(0, 0, 0, 0)):
+    """Keep the child over the placeholder, honouring `inset`.
+
+    `inset` = (left, top, right, bottom) in the placeholder's own PHYSICAL
+    client pixels: pre14 сдвигает и уменьшает окно браузера под ползунки
+    администратора, чтобы страница не уходила под панели GUI. Пустой inset
+    (по умолчанию) даёт ровно прежнее поведение: окно == плейсхолдер.
+    """
     if not user32 or not hwnd or not parent:
         return False
     width, height = client_size(user32, parent)
     if width <= 0 or height <= 0:
         return False
+    left, top, right, bottom = (int(v or 0) for v in (tuple(inset) + (0, 0, 0, 0))[:4])
+    x, y = left, top
+    box_w = width - left - right
+    box_h = height - top - bottom
+    if box_w <= 0 or box_h <= 0:
+        diag.event("win32.SetWindowPos.bad_inset", inset=[left, top, right, bottom],
+                   client=[width, height])
+        return False
     _set_last_error(0)
-    ok = user32.SetWindowPos(hwnd, None, 0, 0, width, height,
+    ok = user32.SetWindowPos(hwnd, None, x, y, box_w, box_h,
                              SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW |
                              SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS)
     if not ok:
         diag.event("win32.SetWindowPos.failed", error=_get_last_error())
     return bool(ok)
-
-
-# ---------------------------------------------------------------- taskbar --
-CLSCTX_ALL = 0x1 | 0x2 | 0x4 | 0x10
-COINIT_APARTMENTTHREADED = 0x2
-CLSID_TASKBAR_LIST = "{56FDF344-FD6D-11d0-958A-006097C9A090}"
-IID_ITASKBAR_LIST = "{56FDF342-FD6D-11d0-958A-006097C9A090}"
-
-
-class GUID(ctypes.Structure):
-    _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
-                ("Data3", wintypes.WORD), ("Data4", wintypes.BYTE * 8)]
-
-
-def _guid(text):
-    """{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx} -> GUID."""
-    raw = (text or "").strip("{}")
-    a, b, c, d, e = raw.split("-")
-    guid = GUID()
-    guid.Data1 = int(a, 16)
-    guid.Data2 = int(b, 16)
-    guid.Data3 = int(c, 16)
-    blob = bytes.fromhex(d + e)
-    for index in range(8):
-        guid.Data4[index] = blob[index]
-    return guid
-
-
-_ole32_cache = {"dll": None}
-
-
-def _ole32():
-    """ole32, созданный один раз (и подменяемый в тестах)."""
-    if _ole32_cache["dll"] is None:
-        _ole32_cache["dll"] = ctypes.WinDLL("ole32", use_last_error=True)
-    return _ole32_cache["dll"]
-
-
-def taskbar_delete_tab(hwnd):
-    """`ITaskbarList::DeleteTab` — снять кнопку окна с панели задач.
-
-    Chrome регистрирует свою кнопку сам (значок «G»), поэтому одного стиля
-    `WS_EX_TOOLWINDOW` мало: оболочку нужно попросить убрать кнопку явно.
-    """
-    if not hwnd:
-        return False
-    try:
-        ole32 = _ole32()
-        try:
-            ole32.CoInitializeEx(None, COINIT_APARTMENTTHREADED)
-        except Exception:
-            pass
-        clsid, iid = _guid(CLSID_TASKBAR_LIST), _guid(IID_ITASKBAR_LIST)
-        instance = ctypes.c_void_p()
-        ole32.CLSIDFromString(CLSID_TASKBAR_LIST, ctypes.byref(clsid))
-        ole32.CLSIDFromString(IID_ITASKBAR_LIST, ctypes.byref(iid))
-        created = ole32.CoCreateInstance(ctypes.byref(clsid), None, CLSCTX_ALL,
-                                         ctypes.byref(iid),
-                                         ctypes.byref(instance))
-        if created < 0 or not instance:
-            diag.event("win32.taskbar.no_instance", hr=int(created))
-            return False
-        table = ctypes.cast(instance,
-                            ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
-        hr_init = ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p)(table[3])
-        delete = ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p,
-                                    wintypes.HWND)(table[5])
-        release = ctypes.WINFUNCTYPE(ctypes.c_uint32, ctypes.c_void_p)(table[2])
-        try:
-            hr_init(instance)
-            result = delete(instance, wintypes.HWND(int(hwnd)))
-        finally:
-            try:
-                release(instance)
-            except Exception:
-                pass
-        ok = int(result) >= 0
-        diag.event("win32.taskbar.delete_tab", hwnd=int(hwnd), hr=int(result), ok=ok)
-        return ok
-    except Exception:
-        diag.exception("win32_embed.taskbar_delete_tab")
-        return False
-
-
-def hide_from_taskbar(user32, hwnd):
-    """Окно не появляется ни в панели задач, ни в Alt+Tab.
-
-    * `WS_EX_TOOLWINDOW` — окно-инструмент: оболочка не показывает его;
-    * `WS_EX_APPWINDOW` снят — иначе окно всё равно попадёт в панель;
-    * `ITaskbarList::DeleteTab` — снять уже зарегистрированную кнопку Chrome.
-    """
-    if not user32 or not hwnd:
-        return False
-    styled = False
-    try:
-        exstyle = get_window_long(user32, hwnd, GWL_EXSTYLE)
-        wanted = (int(exstyle) | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
-        if wanted != int(exstyle):
-            set_window_long(user32, hwnd, GWL_EXSTYLE, wanted)
-            styled = True
-        # Перерисовать рамку: оболочка перечитывает стили окна.
-        user32.SetWindowPos(hwnd, None, 0, 0, 0, 0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
-                            SWP_NOACTIVATE | SWP_FRAMECHANGED)
-    except Exception:
-        diag.exception("win32_embed.taskbar_style")
-    deleted = taskbar_delete_tab(hwnd)
-    diag.event("win32.taskbar_hidden", hwnd=int(hwnd), style=styled,
-               delete_tab=deleted)
-    return bool(styled or deleted)
-
-
-def hide_browser_from_taskbar(user32, pids):
-    """Все окна этого браузера — вне панели задач и вне Alt+Tab."""
-    if not user32:
-        return []
-    windows = []
-    try:
-        windows = _windows_of(user32, process_tree(pids))
-    except Exception:
-        diag.exception("win32_embed.taskbar_enum")
-    hidden = []
-    for info in windows:
-        hwnd = int(info.get("hwnd") or 0)
-        if hwnd and hide_from_taskbar(user32, hwnd):
-            hidden.append(hwnd)
-    return hidden
 
 
 def is_window(user32, hwnd):
