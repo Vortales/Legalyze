@@ -1,0 +1,17 @@
+{
+  "login": "Mike",
+  "password": "lgz1:gAAAAABquQNOqDH-oucnpInCMsP3crVf4UyH5ua28cbHhFW8WI9M_K3cihA9MkXcb8fEDRSxw8AlloJaXomEmv4JKkggcgyM9Q==",
+  "remember": true,
+  "token": "eyJhbGciOiJIUzI1NiJ9.eyJ1c2VySWQiOjMsImxvZ2luIjoiTWlrZSIsInJvbGUiOiJhZG1pbiIsImV4cCI6MTc5MzEwMTkwMH0.N1zVkJkInhJ93DXOO3iTnZwm7QuvMVxiADZUH0cfpCM",
+  "selected_prompt": "Memphis.enc",
+  "hotkey_toggle": "=",
+  "hotkey_mic": "F3",
+  "template": {
+    "Name": "Mike Macmillan",
+    "ID": "85028",
+    "Fraction": "SANG",
+    "Rang": "11",
+    "Department": "MP",
+    "JobTitle": "Заместитель командующего MP, сенатор NG"
+  }
+}

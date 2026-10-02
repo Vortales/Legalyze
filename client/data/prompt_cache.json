@@ -1,0 +1,14 @@
+{
+  "Memphis.enc": {
+    "server_checksum": "348b5b14e7396ca86193fb676d73abddb1f08c3e7c29e74d115eb3354c8903c0",
+    "source_sha256": "348b5b14e7396ca86193fb676d73abddb1f08c3e7c29e74d115eb3354c8903c0",
+    "pdf_name": "Memphis.pdf",
+    "pdf_sha256": "7b01ea179af68cde2e2b8bec53585aaf23fffcb4583e8c90fb387e82c2bac027",
+    "updated_at": 1790195783
+  },
+  "__shablon_txt__": {
+    "template_hash": "b0ffe246aad52e7a863c416ff0f94042a65d8b8269114fffe82361004e5c36f4",
+    "file_sha256": "c5c2986256073f055057ceace26464567463cc1017a83eb94443a3fe6f5e5bb5",
+    "updated_at": 1790195783
+  }
+}

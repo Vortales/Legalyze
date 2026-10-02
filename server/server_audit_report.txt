@@ -1,0 +1,255 @@
+
+================================================================================
+# ОТЧЕТ АУДИТА СЕРВЕРА LEGALYZE (2026-09-27 19:33:28)
+================================================================================
+
+
+================================================================================
+# 1. СИСТЕМА И ЯДРО
+================================================================================
+
+OS / Release:
+PRETTY_NAME="Ubuntu 26.04.1 LTS"
+VERSION_ID="26.04"
+ID=ubuntu
+
+Kernel & Uptime:
+Linux yldpoqbpdw 7.0.0-31-generic #31-Ubuntu SMP PREEMPT_DYNAMIC Sat Aug  1 04:26:38 UTC 2026 x86_64 GNU/Linux
+ 19:33:28 up 7 days,  3:48,  3 users,  load average: 0.00, 0.00, 0.00
+
+Память (RAM):
+total        used        free      shared  buff/cache   available
+Mem:           956Mi       302Mi       249Mi        11Mi       437Mi       653Mi
+Swap:          2.0Gi       120Mi       1.9Gi
+
+Дисковое пространство:
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/vda1       8.6G  6.8G  1.8G  80% /
+/dev/vda1       8.6G  6.8G  1.8G  80% /
+/dev/vda1       8.6G  6.8G  1.8G  80% /
+
+================================================================================
+# 2. СЕТЕВЫЕ ПОРТЫ И ФАЕРВОЛ
+================================================================================
+
+Слушающие порты (TCP):
+tcp   LISTEN 0      511          0.0.0.0:3000      0.0.0.0:*    users:(("next-server (v1",pid=34794,fd=21))               
+tcp   LISTEN 0      511          0.0.0.0:443       0.0.0.0:*    users:(("nginx",pid=34881,fd=11),("nginx",pid=5106,fd=11))
+tcp   LISTEN 0      511          0.0.0.0:80        0.0.0.0:*    users:(("nginx",pid=34881,fd=5),("nginx",pid=5106,fd=5))  
+tcp   LISTEN 0      4096         0.0.0.0:22        0.0.0.0:*    users:(("sshd",pid=1214,fd=3),("systemd",pid=1,fd=225))   
+tcp   LISTEN 0      200        127.0.0.1:5432      0.0.0.0:*    users:(("postgres",pid=27454,fd=6))                       
+tcp   LISTEN 0      4096            [::]:22           [::]:*    users:(("sshd",pid=1214,fd=4),("systemd",pid=1,fd=227))
+
+Статус UFW (Firewall):
+Status: active
+Logging: on (low)
+Default: deny (incoming), allow (outgoing), disabled (routed)
+New profiles: skip
+
+To                         Action      From
+--                         ------      ----
+22/tcp (OpenSSH)           ALLOW IN    Anywhere                  
+80/tcp                     ALLOW IN    Anywhere                  
+443/tcp                    ALLOW IN    Anywhere                  
+3000/tcp                   ALLOW IN    Anywhere                  
+22/tcp (OpenSSH (v6))      ALLOW IN    Anywhere (v6)             
+80/tcp (v6)                ALLOW IN    Anywhere (v6)             
+443/tcp (v6)               ALLOW IN    Anywhere (v6)             
+3000/tcp (v6)              ALLOW IN    Anywhere (v6)
+
+================================================================================
+# 3. СОСТОЯНИЕ И КОНФИГУРАЦИЯ NGINX
+================================================================================
+
+Статус службы Nginx:
+● nginx.service - A high performance web server and a reverse proxy server
+     Loaded: loaded (/usr/lib/systemd/system/nginx.service; enabled; preset: enabled)
+     Active: active (running) since Sun 2026-09-20 16:06:48 UTC; 1 week 0 days ago
+ Invocation: 19378b94c4a949edb054c4040fde5cd0
+       Docs: man:nginx(8)
+   Main PID: 5106 (nginx)
+      Tasks: 2 (limit: 522)
+     Memory: 8.3M (peak: 256.7M, swap: 2.3M, swap peak: 2.3M)
+        CPU: 1min 26.471s
+     CGroup: /system.slice/nginx.service
+             ├─ 5106 "nginx: master process /usr/sbin/nginx -g daemon on; master_process on;"
+             └─34881 "nginx: worker process"
+
+Sep 22 17:05:27 yldpoqbpdw nginx[34059]: 2026/09/22 17:05:27 [notice] 34059#34059: signal process started
+Sep 22 17:05:27 yldpoqbpdw systemd[1]: Reloaded nginx.service - A high performance web server and a reverse proxy server.
+Sep 22 17:13:38 yldpoqbpdw systemd[1]: Reloading nginx.service - A high performance web server and a reverse proxy server...
+Sep 22 17:13:38 yldpoqbpdw nginx[34392]: 2026/09/22 17:13:38 [warn] 34392#34392: conflicting server name "45.153.189.128" on 0.0.0.0:80, ignored
+Sep 22 17:13:38 yldpoqbpdw nginx[34392]: 2026/09/22 17:13:38 [warn] 34392#34392: conflicting server name "45.153.189.128" on 0.0.0.0:443, ignored
+Sep 22 17:13:38 yldpoqbpdw nginx[34392]: 2026/09/22 17:13:38 [notice] 34392#34392: signal process started
+Sep 22 17:13:38 yldpoqbpdw systemd[1]: Reloaded nginx.service - A high performance web server and a reverse proxy server.
+Sep 22 17:23:16 yldpoqbpdw systemd[1]: Reloading nginx.service - A high performance web server and a reverse proxy server...
+Sep 22 17:23:16 yldpoqbpdw nginx[34879]: 2026/09/22 17:23:16 [notice] 34879#34879: signal process started
+Sep 22 17:23:16 yldpoqbpdw systemd[1]: Reloaded nginx.service - A high performance web server and a reverse proxy server.
+
+Тест синтаксиса Nginx (nginx -t):
+nginx: the configuration file /etc/nginx/nginx.conf syntax is ok
+nginx: configuration file /etc/nginx/nginx.conf test is successful
+
+Активные конфигурации Nginx (/etc/nginx/sites-enabled/):
+
+--- [Файл: /etc/nginx/sites-enabled/legalyze] ---
+server {
+    listen 80;
+    server_name 45.153.189.128;
+    client_max_body_size 512m;
+    location / { return 301 https://$host$request_uri; }
+}
+
+server {
+    listen 443 ssl;
+    server_name 45.153.189.128;
+
+    ssl_certificate /etc/ssl/certs/legalyze.crt;
+    ssl_certificate_key /etc/ssl/private/legalyze.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    client_max_body_size 512m;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_request_buffering off;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+    }
+}
+
+
+================================================================================
+# 4. SSL СЕРТИФИКАТЫ (CERTBOT / LET'S ENCRYPT)
+================================================================================
+
+Certbot сертификаты:
+/bin/sh: 1: certbot: not found
+Certbot не установлен
+
+Папка /etc/letsencrypt/live/:
+Папка live отсутствует
+
+================================================================================
+# 5. ПРОЦЕССЫ ПРИЛОЖЕНИЯ (NODE / NEXT.JS / PM2 / DOCKER)
+================================================================================
+
+Версии Node & NPM:
+v22.23.2
+10.9.8
+/bin/sh: 1: pnpm: not found
+/bin/sh: 1: yarn: not found
+
+Статус PM2:
+/bin/sh: 1: pm2: not found
+/bin/sh: 1: pm2: not found
+PM2 не запущен или не установлен
+
+Systemd службы, связанные с legalyze / next / web:
+legalyze.service            loaded active running Legalyze Next.js Application
+  multipathd.service          loaded active running Device-Mapper Multipath Device Controller
+  nginx.service               loaded active running A high performance web server and a reverse proxy server
+
+Запущенные процессы (ps aux):
+root        5106  0.0  0.6  15940  6324 ?        S    Sep20   0:00 nginx: master process /usr/sbin/nginx -g daemon on; master_process on;
+postgres   27454  0.0  0.6 227588  6140 ?        Ss   Sep22   0:28 /usr/lib/postgresql/18/bin/postgres -D /var/lib/postgresql/18/main -c config_file=/etc/postgresql/18/main/postgresql.conf
+postgres   27455  0.0  0.1 227728  1672 ?        Ss   Sep22   0:00 postgres: 18/main: io worker 0
+postgres   27456  0.0  0.1 227728  1372 ?        Ss   Sep22   0:00 postgres: 18/main: io worker 1
+postgres   27457  0.0  0.1 227728  1308 ?        Ss   Sep22   0:00 postgres: 18/main: io worker 2
+postgres   27458  0.0  0.6 227728  6380 ?        Ss   Sep22   0:00 postgres: 18/main: checkpointer 
+postgres   27459  0.0  0.2 227728  2776 ?        Ss   Sep22   0:06 postgres: 18/main: background writer 
+postgres   27461  0.0  0.2 227728  2468 ?        Ss   Sep22   0:08 postgres: 18/main: walwriter 
+postgres   27462  0.0  0.4 229188  4508 ?        Ss   Sep22   0:07 postgres: 18/main: autovacuum launcher 
+postgres   27463  0.0  0.3 229052  3604 ?        Ss   Sep22   0:00 postgres: 18/main: logical replication launcher 
+legalyze   34794  0.0 11.5 13000308 113520 ?     Ssl  Sep22   2:34 next-server (v16.2.6)
+www-data   34881  0.0  1.0  19432 10436 ?        S    Sep22   0:35 nginx: worker process
+
+================================================================================
+# 6. ПРОЕКТ В /var/www/legalyze
+================================================================================
+
+Каталог проекта /var/www/legalyze найден:
+total 360
+drwxr-xr-x   7 legalyze legalyze   4096 Sep 22 15:09 .
+drwxr-xr-x   4 root     root       4096 Sep 20 16:12 ..
+-rw-r-----   1 legalyze legalyze    188 Sep 20 16:24 .env.production
+drwxr-xr-x   9 legalyze legalyze   4096 Sep 22 17:22 .next
+drwxr-xr-x   4 legalyze legalyze   4096 Sep 20 16:21 data
+drwxr-xr-x   3 legalyze legalyze   4096 Sep 20 16:21 drizzle
+-rw-r--r--   1 legalyze legalyze    156 Sep 20 16:21 drizzle.config.json.bak-1789922178
+-rw-r--r--   1 legalyze legalyze    207 Sep 20 16:36 drizzle.config.ts
+-rw-r--r--   1 root     root        510 Sep 22 15:09 migration_0001_app_settings.sql
+-rw-r--r--   1 legalyze legalyze    253 Sep 20 16:26 next-env.d.ts
+-rw-r--r--   1 legalyze legalyze    182 Sep 20 16:40 next.config.ts
+-rw-r--r--   1 legalyze legalyze    185 Sep 20 16:36 next.config.ts.bak-1789922178
+drwxr-xr-x 323 legalyze legalyze  12288 Sep 22 17:20 node_modules
+-rw-r--r--   1 legalyze legalyze 290467 Sep 22 17:20 package-lock.json
+-rw-r--r--   1 legalyze legalyze    851 Sep 22 17:20 package.json
+-rw-r--r--   1 legalyze legalyze    108 Sep 20 16:21 postcss.config.mjs
+drwxr-xr-x   5 legalyze legalyze   4096 Sep 20 16:21 src
+-rw-r--r--   1 legalyze legalyze    723 Sep 20 16:21 tsconfig.json
+
+package.json (скрипты и зависимости):
+{
+  "name": "nextjs-postgresql-template",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "busboy": "^1.6.0",
+    "dotenv": "17.3.1",
+    "drizzle-orm": "0.45.2",
+    "jose": "^6.2.12",
+    "next": "16.2.6",
+    "pg": "8.20.0",
+    "react": "19.2.6",
+    "react-dom": "19.2.6"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.1.17",
+    "@types/busboy": "^1.5.4",
+    "@types/node": "22.19.15",
+    "@types/pg": "8.18.0",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "drizzle-kit": "^0.31.10",
+    "eslint": "9.39.4",
+    "eslint-config-next": "16.2.6",
+    "postcss": "^8.5.8",
+    "tailwindcss": "^4.1.17",
+    "typescript": "^5.9.3"
+  }
+}
+
+
+Переменные .env.production (значения секретов замаскированы):
+NODE_ENV=production
+DATABASE_URL=***[СКРЫТО_В_ЦЕЛЯХ_БЕЗОПАСНОСТИ]***
+JWT_SECRET=***[СКРЫТО_В_ЦЕЛЯХ_БЕЗОПАСНОСТИ]***
+
+Папка .next присутствует (размер: 9.7M	/var/www/legalyze/.next)
+
+Файлы обновлений в /var/www/legalyze/data/updates:
+total 473M
+drwxr-xr-x 2 legalyze legalyze 4.0K Sep 27 19:13 .
+drwxr-xr-x 4 legalyze legalyze 4.0K Sep 20 16:21 ..
+-rw-r--r-- 1 legalyze legalyze 237M Sep 22 17:22 9cf5c134-4bd7-4a7d-ba12-9a35b7d26609.zip
+-rw-r--r-- 1 legalyze legalyze 237M Sep 27 19:14 f9042a38-5d0e-4e47-8827-50d6f20e6e75.zip
+
+================================================================================
+# 7. ПОСЛЕДНИЕ ЛОГИ ОШИБОК NGINX
+================================================================================
+
+Последние 25 строк /var/log/nginx/error.log:
+(нет вывода / пусто)
