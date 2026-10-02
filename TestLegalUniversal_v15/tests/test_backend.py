@@ -1302,6 +1302,121 @@ class StrayWindowTests(unittest.TestCase):
         self.assertFalse(win32_embed.hide_window(None, 77))
 
 
+class NoMissingMethodTests(unittest.TestCase):
+    """Каждый вызов `self._x()` обязан быть настоящим методом класса.
+
+    В первой v15 `_browser_logical_size` вызывал `self._monitor_scale()`,
+    которого НЕ БЫЛО: AttributeError в `_on_browser_ready` ломал скрытие
+    элементов браузера и экспорт файлов. Проверка идёт по всему классу.
+    """
+
+    def _missing(self, class_name):
+        tree = ast.parse((ROOT / 'main.py').read_text())
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                   and n.name == class_name)
+        methods = {n.name for n in cls.body if isinstance(n, ast.FunctionDef)}
+        missing = set()
+        for fn in cls.body:
+            if not isinstance(fn, ast.FunctionDef):
+                continue
+            for node in ast.walk(fn):
+                if (isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == 'self'
+                        and node.func.attr.startswith('_')
+                        and node.func.attr not in methods):
+                    missing.add((fn.name, node.func.attr))
+        return missing
+
+    def test_main_window_calls_only_real_methods(self):
+        self.assertEqual(self._missing('MainWindow'), set())
+
+    def test_native_host_calls_only_real_methods(self):
+        self.assertEqual(self._missing('NativeHost'), set())
+
+    def test_the_monitor_scale_exists_and_is_used(self):
+        tree = ast.parse((ROOT / 'main.py').read_text())
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                   and n.name == 'MainWindow')
+        methods = {n.name: n for n in cls.body if isinstance(n, ast.FunctionDef)}
+        self.assertIn('_monitor_scale', methods)
+        body = ast.unparse(methods['_browser_logical_size'])
+        self.assertIn('self._monitor_scale()', body)
+
+
+class InsetAndComTests(unittest.TestCase):
+    """Сдвиг окна считается от настоящего плейсхолдера, а COM не роняет процесс."""
+
+    def test_browser_host_is_set_before_the_inset_is_computed(self):
+        # Иначе `_placeholder_physical_size` уходит в резерв (413x651 вместо
+        # 453x735), и сдвиг получается на 9 % меньше: -9/-36 вместо -10/-40.
+        source = (ROOT / 'main.py').read_text()
+        start = source.index('def _start_chrome')
+        block = source[start:start + 4000]
+        self.assertLess(block.index('self.browser_host = host'),
+                        block.index('host.inset = self._browser_inset()'))
+
+    def test_the_inset_is_recomputed_once_the_placeholder_is_real(self):
+        source = (ROOT / 'main.py').read_text()
+        ready = source.split('def _on_browser_ready(', 1)[1].split('\n    def ', 1)[0]
+        self.assertIn('host.inset = self._browser_inset()', ready)
+        self.assertIn('host.sync()', ready)
+
+    def test_com_calls_use_integer_addresses(self):
+        # `proto(c_void_p)` — TypeError, а вызов по мусорному адресу —
+        # access violation. Адрес обязан быть целым, слот — проверенным.
+        source = (ROOT / 'win32_embed.py').read_text()
+        self.assertIn('ctypes.c_void_p(int(interface))', source)
+        self.assertIn('address = int(table[slot] or 0)', source)
+        self.assertIn('if not address:', source)
+        self.assertIn('fn = proto(address)', source)
+
+    def test_com_disables_itself_after_an_access_violation(self):
+        source = (ROOT / 'win32_embed.py').read_text()
+        self.assertIn('_COM_DISABLED = False', source)
+        self.assertIn('_COM_DISABLED = True', source)
+        self.assertIn('if not hwnd or _COM_DISABLED:', source)
+        # OSError (access violation) обрабатывается отдельно от прочих ошибок.
+        block = source.split('def _com_call(', 1)[1].split('\n\ndef ', 1)[0]
+        self.assertIn('except OSError:', block)
+
+    def test_the_taskbar_com_can_be_switched_off(self):
+        source = (ROOT / 'main.py').read_text()
+        start = source.index('НАСТРОЙКИ РАСПОЛОЖЕНИЯ ОБЪЕКТОВ')
+        end = source.index('конец блока настроек')
+        self.assertIn('TASKBAR_DELETE_TAB = True', source[start:end])
+        self.assertIn('delete_tab=bool(TASKBAR_DELETE_TAB)', source)
+
+    def test_the_shift_is_exact_at_100_percent(self):
+        # Резервный размер (413x651) давал бы -9/-36 — здесь его быть не должно.
+        tree = ast.parse((ROOT / 'main.py').read_text())
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                   and n.name == 'MainWindow')
+        node = next(n for n in cls.body if isinstance(n, ast.FunctionDef)
+                    and n.name == '_browser_inset')
+        body = list(node.body)
+        if isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+            body = body[1:]
+        clone = ast.FunctionDef(name='_browser_inset', args=node.args, body=body,
+                                decorator_list=[], returns=None,
+                                type_comment=None, type_params=[])
+        ast.fix_missing_locations(clone)
+        scope = {'BROWSER_DX': -10, 'BROWSER_DY': -40, 'BROWSER_DW': 0,
+                 'BROWSER_DH': 0, 'int': int, 'float': float, 'round': round,
+                 'TypeError': TypeError, 'ValueError': ValueError}
+        exec(compile(ast.Module(body=[clone], type_ignores=[]), '<i>', 'exec'), scope)
+        owner = SimpleNamespace(cfg={})
+        owner._placeholder_logical_size = lambda: (453, 735)
+        owner._placeholder_physical_size = lambda: (453, 735)
+        owner._browser_inset = scope['_browser_inset'].__get__(owner)
+        self.assertEqual(owner._browser_inset(), (-10, -40, 10, 40))
+        # Окно при этом остаётся прежнего размера (правый/нижний inset зеркален).
+        left, top, right, bottom = owner._browser_inset()
+        self.assertEqual(453 - left - right, 453)
+        self.assertEqual(735 - top - bottom, 735)
+
+
 class SpeechBackendTests(unittest.TestCase):
     def setUp(self):
         self.events = []

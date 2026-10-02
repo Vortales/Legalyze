@@ -114,7 +114,11 @@ INPUT_SELECTOR = ('textarea, div[contenteditable="true"], rich-textarea, '
                   '[role="textbox"], input[type="text"]')
 
 # --- поведение лишних окон браузера ---
-CLOSE_STRAY_WINDOWS = True   # после скрытия закрывать лишнее окно приложения
+CLOSE_STRAY_WINDOWS = True    # после скрытия закрывать лишнее окно приложения
+TASKBAR_DELETE_TAB = True     # доп. снимать кнопку через ITaskbarList.
+                              # Если COM хоть раз упадёт, он отключится сам,
+                              # а стиль WS_EX_TOOLWINDOW продолжит работать.
+                              # Поставьте False, чтобы не звать COM вообще.
 # =========================== конец блока настроек ============================
 
 # Журнал pid своего браузера: по нему добиваемся то, что осталось от прошлого
@@ -2489,7 +2493,8 @@ class NativeHost(QObject):
             return
         self.refresh_pids()
         try:
-            win32_embed.hide_from_taskbar(self.user32, self.hwnd)
+            win32_embed.hide_from_taskbar(self.user32, self.hwnd,
+                                          delete_tab=bool(TASKBAR_DELETE_TAB))
             self._hide_strays(keep=self.hwnd)
         except Exception:
             diag.exception("main.hide_taskbar")
@@ -2516,7 +2521,8 @@ class NativeHost(QObject):
             return
         try:
             win32_embed.hide_stray_windows(self.user32, self.pids, keep=keep,
-                                           close_after_hide=bool(CLOSE_STRAY_WINDOWS))
+                                           close_after_hide=bool(CLOSE_STRAY_WINDOWS),
+                                           delete_tab=bool(TASKBAR_DELETE_TAB))
         except Exception:
             diag.exception("main.hide_strays")
 
@@ -3392,6 +3398,17 @@ class MainWindow(QMainWindow):
                 diag.exception("main.browser_physical")
         return placeholder_size
 
+    def _monitor_scale(self):
+        """Масштаб монитора: физический пиксель / DIP.
+
+        1.0 при 100 %, 1.25 при 125 %, 1.5 при 150 %. Без этого метода перевод
+        физического размера окна в DIP невозможен.
+        """
+        logical_w, logical_h = self._placeholder_logical_size()
+        physical_w, physical_h = self._placeholder_physical_size()
+        scale = (float(physical_w) / float(logical_w)) if logical_w else 1.0
+        return scale if scale > 0 else 1.0
+
     def _browser_logical_size(self):
         """Логический (DIP) размер САМОГО окна браузера.
 
@@ -3911,10 +3928,14 @@ class MainWindow(QMainWindow):
         host = NativeHost(self, url=URL, profile=BROWSER_PROFILE,
                           width=W, height=H,
                           configured=(self.cfg.get("browser_path") or None))
+        # ВАЖНО: сначала `browser_host`, потом расчёт сдвига. `_browser_inset`
+        # берёт ФИЗИЧЕСКИЙ размер плейсхолдера через `browser_host.user32`;
+        # без этого он уходил в резерв (413x651 вместо 453x735) и сдвиг
+        # получался на 9 % меньше нужного (-9/-36 вместо -10/-40).
+        self.browser_host = host
         host.inset = self._browser_inset()
         host.ready.connect(self._on_browser_ready)
         host.failed.connect(self._on_browser_failed)
-        self.browser_host = host
         if not host.start(self.browser_placeholder):
             self._start_embedded_fallback("no-browser")
 
@@ -3945,6 +3966,15 @@ class MainWindow(QMainWindow):
             self.zoom_timer = QTimer(self)
             self.zoom_timer.timeout.connect(self._ensure_zoom)
         self.zoom_timer.start(5000)
+        # Сдвиг пересчитывается по настоящему плейсхолдеру: при `_start_chrome`
+        # окно Qt ещё могло быть без корректного HWND.
+        try:
+            host = getattr(self, "browser_host", None)
+            if host is not None:
+                host.inset = self._browser_inset()
+                host.sync()
+        except Exception:
+            diag.exception("main.reinset")
         # v15: Chrome сам возвращает кнопку в панель задач — проверяем раз в 5 с.
         self.taskbar_timer.start(5000)
         # Сдвиги страницы из блока настроек — один раз, когда страница уже есть.

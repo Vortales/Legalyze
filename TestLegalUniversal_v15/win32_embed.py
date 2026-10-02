@@ -579,16 +579,37 @@ def _ole32():
         return None
 
 
+#: True после первой же ошибки обращения к памяти: COM в этом процессе
+#: больше не трогаем, чтобы чужая vtable не уронила всё приложение.
+_COM_DISABLED = False
+
+
 def _com_call(interface, slot, *args):
-    """Вызов слота vtable COM-интерфейса. Вне Windows всегда None."""
-    if not interface or WNDENUMPROC is None:
+    """Вызов слота vtable COM-интерфейса. Вне Windows всегда None.
+
+    Адрес ОБЯЗАН быть целым: `proto(c_void_p)` — это TypeError, а попытка
+    вызвать «функцию» по мусорному адресу — access violation (именно это и
+    произошло в первой v15).
+    """
+    global _COM_DISABLED
+    if _COM_DISABLED or not interface or WNDENUMPROC is None:
         return None
     try:
-        table = ctypes.cast(ctypes.c_void_p(interface), ctypes.POINTER(ctypes.c_void_p))
+        table = ctypes.cast(ctypes.c_void_p(int(interface)),
+                            ctypes.POINTER(ctypes.c_void_p))
+        address = int(table[slot] or 0)
+        if not address:
+            diag.event("win32.com_empty_slot", slot=int(slot))
+            return None
         proto = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p,
                                    *([wintypes.HWND] * len(args)))
-        fn = proto(table[slot])
-        return int(fn(ctypes.c_void_p(interface), *args))
+        fn = proto(address)
+        return int(fn(ctypes.c_void_p(int(interface)), *args))
+    except OSError:
+        # Доступ к чужой памяти: один раз достаточно, дальше без COM.
+        _COM_DISABLED = True
+        diag.exception("win32_embed.com_call_av")
+        return None
     except Exception:
         diag.exception("win32_embed.com_call")
         return None
@@ -599,8 +620,9 @@ def taskbar_delete_tab(hwnd):
 
     Именно это и нужно в v15: стиля `WS_EX_TOOLWINDOW` недостаточно, потому
     что Chrome сам возвращает свою кнопку через `ITaskbarList::AddTab`.
+    Если COM хоть раз упал, сюда больше не заходим вообще.
     """
-    if not hwnd:
+    if not hwnd or _COM_DISABLED:
         return False
     ole32 = _ole32()
     if ole32 is None:
@@ -630,8 +652,11 @@ def taskbar_delete_tab(hwnd):
             _com_call(pointer.value, _COM_RELEASE)
 
 
-def hide_from_taskbar(user32, hwnd):
-    """Окно не должно появляться в панели задач: стиль + DeleteTab."""
+def hide_from_taskbar(user32, hwnd, delete_tab=True):
+    """Окно не должно появляться в панели задач: стиль + DeleteTab.
+
+    `delete_tab=False` — только стиль (если COM в этом процессе отключён).
+    """
     if not user32 or not hwnd:
         return False
     styled = False
@@ -646,7 +671,7 @@ def hide_from_taskbar(user32, hwnd):
         styled = True
     except Exception:
         diag.exception("win32_embed.taskbar_style")
-    deleted = taskbar_delete_tab(hwnd)
+    deleted = taskbar_delete_tab(hwnd) if delete_tab else False
     diag.event("win32.taskbar_hidden", hwnd=int(hwnd), style=styled,
                delete_tab=bool(deleted))
     return bool(styled or deleted)
@@ -663,7 +688,8 @@ def hide_window(user32, hwnd):
         return False
 
 
-def hide_stray_windows(user32, pids, keep=0, close_after_hide=False):
+def hide_stray_windows(user32, pids, keep=0, close_after_hide=False,
+                       delete_tab=True):
     """Скрыть ВСЕ окна дерева браузера, кроме встроенного (`keep`).
 
     Chrome поднимает вспомогательные поверхности, и именно они копятся в панели
@@ -687,7 +713,7 @@ def hide_stray_windows(user32, pids, keep=0, close_after_hide=False):
         except Exception:
             diag.exception("win32_embed.hide_stray")
             continue
-        hide_from_taskbar(user32, hwnd)
+        hide_from_taskbar(user32, hwnd, delete_tab=delete_tab)
         hidden.append(hwnd)
         if close_after_hide and info.get("class") == BROWSER_WINDOW_CLASS:
             try:
