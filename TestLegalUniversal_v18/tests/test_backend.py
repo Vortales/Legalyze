@@ -1,4 +1,26 @@
 import ast
+import re
+
+
+def _without_docstring(text, triple=False):
+    """Убрать строку документации: в пояснениях имена флагов упоминаются."""
+    if triple:
+        return re.sub(r'""".*?"""', '', text, flags=re.S)
+    try:
+        node = ast.parse(text)
+    except Exception:
+        return text
+    bodies = [node.body]
+    for item in list(node.body):
+        if isinstance(item, (ast.FunctionDef, ast.ClassDef)):
+            bodies.append(item.body)
+    for body in bodies:
+        for item in list(body):
+            if isinstance(item, ast.Expr) and isinstance(item.value, ast.Constant) \
+                    and isinstance(item.value.value, str):
+                body.remove(item)
+                break
+    return ast.unparse(node)
 import builtins
 import contextlib
 import io
@@ -403,7 +425,10 @@ class SourceTests(unittest.TestCase):
         self.assertIn('_ensure_zoom', methods)
         self.assertIn('_placeholder_physical_size', methods)
         self.assertIn('_placeholder_logical_size', methods)
-        guard = ast.unparse(methods['_ensure_zoom'])
+        # v18.1: сам проход сторожа — в `_zoom_guard_once`, он же вызывается
+        # и по таймеру, и сразу после показа окна.
+        guard = (ast.unparse(methods['_ensure_zoom'])
+                 + ast.unparse(methods['_zoom_guard_once']))
         self.assertIn('zoom_ok(page', guard)
         self.assertIn('apply_zoom(page', guard)
         self.assertIn('daemon=True', guard)          # GUI не блокируется
@@ -801,6 +826,50 @@ class SourceTests(unittest.TestCase):
         self.assertIn('def discover_browsers(', (ROOT / 'native_browser.py').read_text())
         self.assertIn('("browser", "chromium")', (ROOT / 'native_browser.py').read_text())
 
+    def test_v18_1_returns_the_layout_immediately_after_the_show(self):
+        # «Объекты съехали и встали на место только через пару секунд»:
+        # раскладку чинил сторож зума раз в 5 с. Теперь проверка и починка
+        # запускаются сразу же, на каждом шаге «оживления».
+        main_src = (ROOT / 'main.py').read_text()
+        for text in ('def _zoom_guard_once(', 'self._zoom_guard_once(page, reason="revive")',
+                     '_zoom_lock', 'REVIVE_STEPS', 'self._revive_settled'):
+            self.assertIn(text, main_src)
+        tree = ast.parse(main_src)
+        window = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                      and n.name == 'MainWindow')
+        methods = {m.name: m for m in window.body if isinstance(m, ast.FunctionDef)}
+        revive = ast.unparse(methods['_revive_browser'])
+        move = ast.unparse(methods['_browser_sync_args'])
+        # Обычный sync() асинхронный (SWP_ASYNCWINDOWPOS) — здесь нужен не он.
+        self.assertIn('sync_now(', revive + move)
+        # (в пояснении к методу имя флага упоминается — считаем только код)
+        self.assertNotIn('SWP_ASYNCWINDOWPOS', _without_docstring(revive))
+        # В фоновый поток уходят только HWND и числа, Qt вызывается в главном.
+        self.assertIn('self._browser_inset()', move)
+        self.assertIn('threading.Thread(', revive)
+        # Пока окно скрыто — браузер тоже ставится на место (невидимо).
+        self.assertIn('self._sync_browser_now()', ast.unparse(methods['hideEvent']))
+        # Стоп-кран: как только два измерения подряд сошлись — не дёргаем.
+        self.assertIn('_revive_settled', revive)
+
+    def test_v18_1_window_shift_is_20_dip_up(self):
+        # Калибровка пользователя: сдвиг окна браузера по Y = -20 DIP.
+        main_src = (ROOT / 'main.py').read_text()
+        self.assertIn('BROWSER_DY = -20', main_src)
+        self.assertIn('BROWSER_DX = -10', main_src)
+
+    def test_v18_1_sync_now_moves_the_window_synchronously(self):
+        embed = (ROOT / 'win32_embed.py').read_text()
+        self.assertIn('def sync_now(', embed)
+        body = embed.split('def sync_now(', 1)[1].split('\ndef ', 1)[0]
+        body = _without_docstring(body, triple=True)
+        self.assertIn('SetWindowPos', body)
+        self.assertIn('SWP_FRAMECHANGED', body)
+        # Именно асинхронный флаг и давал «съехавшее» окно на секунду-две.
+        self.assertNotIn('SWP_ASYNCWINDOWPOS', body)
+        sync_body = embed.split('def sync(', 1)[1].split('\ndef ', 1)[0]
+        self.assertIn('SWP_ASYNCWINDOWPOS', sync_body)
+
     def test_v18_revives_the_browser_after_minimize(self):
         main_src = (ROOT / 'main.py').read_text()
         for text in ('def _schedule_revive', 'def _revive_browser',
@@ -997,7 +1066,8 @@ class SourceTests(unittest.TestCase):
         methods = {m.name: m for m in window.body if isinstance(m, ast.FunctionDef)}
         for forbidden in ('_restart_browser_dsf', '_press_zoom_key'):
             self.assertNotIn(forbidden, methods)
-        guard = ast.unparse(methods['_ensure_zoom'])
+        guard = (ast.unparse(methods['_ensure_zoom'])
+                 + ast.unparse(methods['_zoom_guard_once']))
         self.assertNotIn('press', guard)
         self.assertNotIn('restart', guard)
         self.assertIn('apply_zoom(page', guard)
@@ -1021,7 +1091,7 @@ class BrowserWindowTests(unittest.TestCase):
     def test_the_shift_is_baked_in_as_constants(self):
         source = (ROOT / 'main.py').read_text()
         self.assertIn('BROWSER_DX = -10', source)
-        self.assertIn('BROWSER_DY = -40', source)
+        self.assertIn('BROWSER_DY = -20', source)
         # ...и реально передаётся окну браузера, а не лежит мёртвым грузом.
         self.assertIn('host.inset = self._browser_inset()', source)
         for name in ('_browser_inset', '_hide_browser_taskbar'):
@@ -1268,7 +1338,9 @@ class PlacementSettingsTests(unittest.TestCase):
 
     def test_the_guard_passes_the_configured_zoom(self):
         source = (ROOT / 'main.py').read_text()
-        guard = source.split('def _ensure_zoom(', 1)[1].split('\n    def ', 1)[0]
+        # v18.1: сторож разделён — тонкая проверка живёт в `_zoom_guard_once`.
+        guard = source.split('def _zoom_guard_once(', 1)[1].split('\n    def ', 1)[0]
+        guard += source.split('def _ensure_zoom(', 1)[1].split('\n    def ', 1)[0]
         self.assertIn('self._zoom_args()', guard)
         self.assertIn('zoom=PAGE_ZOOM', guard)
         # Сдвиги страницы внедряются тем же сторожем (после перезагрузки

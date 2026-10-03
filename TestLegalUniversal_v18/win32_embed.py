@@ -748,6 +748,31 @@ def invalidate(user32, hwnd):
         return False
 
 
+def sync_now(user32, hwnd, parent, inset=(0, 0, 0, 0)):
+    """То же, что `sync`, но СИНХРОННО — без `SWP_ASYNCWINDOWPOS` (v18.1).
+
+    С асинхронным флагом система лишь ОТПРАВЛЯЕТ запрос в поток Chrome и не
+    ждёт его: после показа скрытого окна браузер ещё секунду-две рисуется на
+    старом месте, и содержимое выглядит съехавшим. Здесь вызов возвращается
+    только когда перемещение применено, поэтому съехавший кадр не успевает
+    попасть на экран. Используется редко (только при показе окна), поэтому
+    ожидание потока Chrome здесь безопаснее, чем в общем `sync`.
+    """
+    if not user32 or not hwnd or not parent:
+        return False
+    box = box_for(user32, parent, inset)
+    if box is None:
+        return False
+    x, y, width, height = box
+    _set_last_error(0)
+    ok = user32.SetWindowPos(hwnd, None, x, y, width, height,
+                             SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW |
+                             SWP_FRAMECHANGED)
+    if not ok:
+        diag.event("win32.SetWindowPosSync.failed", error=_get_last_error())
+    return bool(ok)
+
+
 def hide_window(user32, hwnd):
     """Скрыть окно целиком: не видно ни на экране, ни в Alt+Tab."""
     if not user32 or not hwnd:

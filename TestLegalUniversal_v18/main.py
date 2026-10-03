@@ -92,7 +92,7 @@ X, Y, W, H = 1426, 200, 453, 735
 
 # --- окно браузера внутри окна программы, DIP (сдвиг и изменение размера) ---
 BROWSER_DX = -10     # сдвиг окна браузера по X: -10 = влево, +10 = вправо
-BROWSER_DY = -40     # сдвиг окна браузера по Y: -40 = вверх, +40 = вниз
+BROWSER_DY = -20     # сдвиг окна браузера по Y: -20 = вверх, +20 = вниз
 BROWSER_DW = 0       # изменить ширину окна браузера (0 = не менять)
 BROWSER_DH = 0       # изменить высоту окна браузера (0 = не менять)
 
@@ -131,6 +131,10 @@ AUTO_INSTALL_BROWSER = True  # если настоящего Chrome нет — �
                           # речевые пакеты Windows не нужны).
 REVIVE_AFTER_SHOW = True  # «оживлять» браузер после сворачивания/разворачивания
                           # окна: иначе вместо страницы остаётся чёрный фон.
+REVIVE_STEPS = (0, 120, 300, 600, 1200)  # мс: Chromium применяет перенос окна
+                          # и перерисовку не мгновенно, поэтому проверяем
+                          # несколько раз подряд и останавливаемся, как только
+                          # два измерения подряд сошлись.
 
 # --- поведение лишних окон браузера ---
 CLOSE_STRAY_WINDOWS = True    # после скрытия закрывать лишнее окно приложения
@@ -3156,6 +3160,8 @@ class MainWindow(QMainWindow):
         self._fetch_dialog = None
         self._was_hidden = False
         self._was_minimized = False
+        self._revive_settled = 0
+        self._zoom_lock = threading.Lock()
         # v18: язык речевого ввода и тема страницы (правятся в config.json).
         self.speech_lang = str(self.cfg.get("speech_lang") or SPEECH_LANG or "ru-RU")
         self.light_theme = bool(self.cfg.get("light_theme", FORCE_LIGHT_THEME))
@@ -3544,6 +3550,9 @@ class MainWindow(QMainWindow):
     def hideEvent(self, event):
         super().hideEvent(event)
         self._was_hidden = True
+        # v18.1: окно всё равно не видно — ставим браузер точно на место,
+        # чтобы к следующему показу он уже стоял там, где нужно.
+        self._sync_browser_now()
 
     def changeEvent(self, event):
         super().changeEvent(event)
@@ -3836,35 +3845,54 @@ class MainWindow(QMainWindow):
         page = getattr(getattr(self, "worker", None), "page", None)
         if page is None:
             return
-        logical_w, logical_h, physical_w, physical_h = self._zoom_args()
+        threading.Thread(target=self._zoom_guard_once, args=(page, "timer"),
+                         daemon=True).start()
 
-        def guard():
+    def _zoom_guard_once(self, page, reason="guard"):
+        """ОДИН проход сторожа зума: измерить и, если надо, вернуть. True — всё верно.
+
+        Выделено из `_ensure_zoom` в v18.1: после показа окна раскладку надо
+        проверять и чинить **сразу**, а не ждать следующего тика таймера
+        (5 с — отсюда и «съехало и встало на место только через пару секунд»).
+
+        Одновременные проходы исключены (`_zoom_lock`): два потока не должны
+        наперебой слать `Emulation.setDeviceMetricsOverride`.
+        """
+        if page is None or self._closing:
+            return False
+        if not self._zoom_lock.acquire(blocking=False):
+            return True          # уже проверяется в соседнем потоке
+        try:
+            logical_w, logical_h, physical_w, physical_h = self._zoom_args()
+            # v18: язык и тема держатся намертво — после перезагрузки
+            # страницы Chrome возвращает системные значения.
             try:
-                # v18: язык и тема держатся намертво — после перезагрузки
-                # страницы Chrome возвращает системные значения.
-                try:
-                    apply_language_and_theme(page, self.speech_lang, self.light_theme)
-                except Exception:
-                    diag.exception("main.zoom_guard_theme")
-                # Сдвиги страницы внедряются и держатся (после перезагрузки
-                # стиль пропадает, поэтому он проверяется каждый проход).
-                if page_tuning_needed():
-                    try:
-                        page.eval(page_tune_js(with_scroll=False), timeout=4)
-                    except Exception:
-                        diag.exception("main.page_tune")
-                ok, _metrics = zoom_ok(page, logical_w, logical_h, physical_w,
-                                       physical_h, zoom=PAGE_ZOOM)
-                if ok:
-                    return
-                result = apply_zoom(page, logical_w, logical_h, physical_w,
-                                    physical_h, zoom=PAGE_ZOOM)
-                diag.event("browser.zoom_restored",
-                           source=(result or {}).get("source"))
+                apply_language_and_theme(page, self.speech_lang, self.light_theme)
             except Exception:
-                diag.exception("main.zoom_guard")
-
-        threading.Thread(target=guard, daemon=True).start()
+                diag.exception("main.zoom_guard_theme")
+            # Сдвиги страницы внедряются и держатся (после перезагрузки
+            # стиль пропадает, поэтому он проверяется каждый проход).
+            if page_tuning_needed():
+                try:
+                    page.eval(page_tune_js(with_scroll=False), timeout=4)
+                except Exception:
+                    diag.exception("main.page_tune")
+            ok, metrics = zoom_ok(page, logical_w, logical_h, physical_w,
+                                  physical_h, zoom=PAGE_ZOOM)
+            if ok:
+                return True
+            result = apply_zoom(page, logical_w, logical_h, physical_w,
+                                physical_h, zoom=PAGE_ZOOM)
+            diag.event("browser.zoom_restored",
+                       source=(result or {}).get("source"), reason=str(reason),
+                       inner=(metrics or {}).get("innerWidth"),
+                       dpr=round(float((metrics or {}).get("dpr") or 0.0), 3))
+            return bool((result or {}).get("ok"))
+        except Exception:
+            diag.exception("main.zoom_guard")
+            return False
+        finally:
+            self._zoom_lock.release()
 
     def _apply_page_tuning(self):
         """Однократно применить сдвиги страницы вместе с прокруткой."""
@@ -4432,35 +4460,97 @@ class MainWindow(QMainWindow):
     def _schedule_revive(self):
         if not REVIVE_AFTER_SHOW or self._closing:
             return
-        for delay in (0, 150, 450):
+        self._revive_settled = 0
+        for delay in REVIVE_STEPS:
             QTimer.singleShot(delay, self._revive_browser)
 
-    def _revive_browser(self):
-        """Перерисовать браузер после сворачивания/разворачивания окна (v18).
+    def _browser_sync_args(self):
+        """(user32, hwnd, parent, inset) для СИНХРОННОГО переноса окна браузера.
 
-        Пока родительское окно скрыто, скрыто и дочернее окно браузера, а
-        Chromium приостанавливает отрисовку: после показа остаётся чёрный
-        прямоугольник. Перезапуск кадра делается в три слоя — Win32 (показ +
-        перерисовка), CDP (`Page.bringToFront`, событие resize) и, только если
-        метрики действительно переопределены, «дёрганье» на 1 px с возвратом.
+        Всё, что зависит от Qt, берётся здесь, в ГЛАВНОМ потоке; в фоновый
+        уходят только HWND и числа. None — переносить нечего.
         """
         if self._closing or not self.native_mode:
-            return
+            return None
         host = getattr(self, "browser_host", None)
         if host is None or host.user32 is None or not host.hwnd:
-            return
+            return None
         try:
-            host.sync()
-            win32_embed.show_window(host.user32, host.hwnd)
-            win32_embed.invalidate(host.user32, host.hwnd)
+            host.inset = self._browser_inset()
         except Exception:
-            diag.exception("main.revive_win32")
-        page = getattr(getattr(self, "worker", None), "page", None)
-        if page is None:
+            diag.exception("main.revive_inset")
+        try:
+            parent = int(self.browser_placeholder.winId())
+        except Exception:
+            diag.exception("main.revive_parent")
+            parent = 0
+        return host.user32, int(host.hwnd), parent, tuple(host.inset)
+
+    def _sync_browser_now(self):
+        """Поставить окно браузера на место СИНХРОННО (в фоновом потоке)."""
+        args = self._browser_sync_args()
+        if args is None:
             return
+        user32, hwnd, parent, inset = args
 
         def task():
             try:
+                win32_embed.sync_now(user32, hwnd, parent, inset)
+            except Exception:
+                diag.exception("main.sync_now")
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _revive_browser(self):
+        """Вернуть браузер на место и перерисовать его после показа окна (v18.1).
+
+        Пока родительское окно скрыто, скрыто и дочернее окно браузера, а
+        Chromium приостанавливает отрисовку: после показа остаётся чёрный
+        прямоугольник (v17). Обычный `sync()` переносит окно **асинхронно**
+        (`SWP_ASYNCWINDOWPOS`): запрос уходит в поток Chrome и не ждётся,
+        поэтому окно браузера ещё секунду-две висит на старом месте —
+        содержимое видно съехавшим, и только сторож зума (раз в 5 с)
+        возвращает всё на место. Отсюда «объекты съехали и встали через
+        2 секунды».
+
+        Что делается здесь, на каждом шаге `REVIVE_STEPS`:
+
+        1. **синхронный** перенос окна (`win32_embed.sync_now`, без
+           `SWP_ASYNCWINDOWPOS`) — пока вызов не вернулся, окно уже там, где
+           нужно, поэтому съехавший кадр просто не успевает появиться;
+        2. `ShowWindow(SW_SHOWNA)` + `InvalidateRect`/`UpdateWindow` — кадр;
+        3. по CDP: `Page.bringToFront`, событие `resize`, язык и тема;
+        4. **измерение раскладки и немедленный возврат зума 67 %**, если
+           измерение не сошлось (`_zoom_guard_once`) — а не через 5 с;
+        5. «дёрганье» метрик на 1 px — только когда они уже верные.
+
+        Останавливаемся, как только два измерения подряд сошлись.
+        """
+        if self._closing or not self.native_mode:
+            return
+        if getattr(self, "_revive_settled", 0) >= 2:
+            return          # уже всё на месте — дальше не дёргаем
+        args = self._browser_sync_args()
+        if args is None:
+            return
+        user32, hwnd, parent, inset = args
+        page = getattr(getattr(self, "worker", None), "page", None)
+        step = getattr(self, "_revive_step", 0)
+        self._revive_step = step + 1
+
+        def task():
+            try:
+                try:
+                    win32_embed.sync_now(user32, hwnd, parent, inset)
+                except Exception:
+                    diag.exception("main.revive_sync")
+                try:
+                    win32_embed.show_window(user32, hwnd)
+                    win32_embed.invalidate(user32, hwnd)
+                except Exception:
+                    diag.exception("main.revive_win32")
+                if page is None:
+                    return
                 try:
                     page.send("Page.bringToFront", {}, timeout=3)
                 except Exception:
@@ -4469,12 +4559,15 @@ class MainWindow(QMainWindow):
                     page.eval(JS_REVIVE, timeout=3)
                 except Exception:
                     pass
-                try:
-                    apply_language_and_theme(page, self.speech_lang, self.light_theme)
-                except Exception:
-                    pass
-                self._nudge_metrics(page)
-                diag.event("browser.revived")
+                # Раскладка — ИЗМЕРЕНИЕМ и сразу, без ожидания сторожа.
+                ok = self._zoom_guard_once(page, reason="revive")
+                if ok:
+                    self._nudge_metrics(page)
+                settled = (getattr(self, "_revive_settled", 0) + 1) if ok else 0
+                self._revive_settled = settled
+                diag.event("browser.revive", step=int(step), ok=bool(ok),
+                           settled=int(settled), inset=list(inset),
+                           client=list(win32_embed.client_size(user32, hwnd)))
             except Exception:
                 diag.exception("main.revive_cdp")
 
