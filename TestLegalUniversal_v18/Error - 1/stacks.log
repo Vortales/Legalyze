@@ -1,0 +1,32 @@
+Windows fatal exception: access violation
+
+Thread 0x00003f98 (most recent call first):
+  File "C:\Users\admin\AppData\Local\Temp\onefile_15720_694184_6Miu7CxKdyU\diagnostics.py", line 146 in watch
+  File "C:\Users\admin\AppData\Local\Temp\onefile_15720_694184_6Miu7CxKdyU\threading.py", line 1012 in run
+  File "C:\Users\admin\AppData\Local\Temp\onefile_15720_694184_6Miu7CxKdyU\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\admin\AppData\Local\Temp\onefile_15720_694184_6Miu7CxKdyU\threading.py", line 1032 in _bootstrap
+
+Current thread 0x00002bc8 (most recent call first):
+  File "C:\Users\admin\AppData\Local\Temp\onefile_15720_694184_6Miu7CxKdyU\win32_embed.py", line 603 in _com_call
+  File "C:\Users\admin\AppData\Local\Temp\onefile_15720_694184_6Miu7CxKdyU\win32_embed.py", line 634 in taskbar_delete_tab
+  File "C:\Users\admin\AppData\Local\Temp\onefile_15720_694184_6Miu7CxKdyU\win32_embed.py", line 671 in hide_from_taskbar
+  File "C:\Users\admin\AppData\Local\Temp\onefile_15720_694184_6Miu7CxKdyU\main.py", line 2616 in hide_taskbar
+  File "C:\Users\admin\AppData\Local\Temp\onefile_15720_694184_6Miu7CxKdyU\main.py", line 2580 in _embed
+  File "C:\Users\admin\AppData\Local\Temp\onefile_15720_694184_6Miu7CxKdyU\main.py", line 2546 in _tick
+  File "C:\Users\admin\AppData\Local\Temp\onefile_15720_694184_6Miu7CxKdyU\main.py", line 5662 in main
+  File "C:\Users\admin\AppData\Local\Temp\onefile_15720_694184_6Miu7CxKdyU\diagnostics.py", line 54 in wrapped
+  File "C:\Users\admin\AppData\Local\Temp\onefile_15720_694184_6Miu7CxKdyU\main.py", line 1 in <module>
+Timeout (0:01:00)!
+Thread 0x00002458 (most recent call first):
+  File "C:\Users\admin\AppData\Local\Temp\onefile_15720_694184_6Miu7CxKdyU\main.py", line 2947 in run
+
+Thread 0x00003f98 (most recent call first):
+  File "C:\Users\admin\AppData\Local\Temp\onefile_15720_694184_6Miu7CxKdyU\diagnostics.py", line 146 in watch
+  File "C:\Users\admin\AppData\Local\Temp\onefile_15720_694184_6Miu7CxKdyU\threading.py", line 1012 in run
+  File "C:\Users\admin\AppData\Local\Temp\onefile_15720_694184_6Miu7CxKdyU\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\admin\AppData\Local\Temp\onefile_15720_694184_6Miu7CxKdyU\threading.py", line 1032 in _bootstrap
+
+Thread 0x00002bc8 (most recent call first):
+  File "C:\Users\admin\AppData\Local\Temp\onefile_15720_694184_6Miu7CxKdyU\main.py", line 5662 in main
+  File "C:\Users\admin\AppData\Local\Temp\onefile_15720_694184_6Miu7CxKdyU\diagnostics.py", line 54 in wrapped
+  File "C:\Users\admin\AppData\Local\Temp\onefile_15720_694184_6Miu7CxKdyU\main.py", line 1 in <module>
