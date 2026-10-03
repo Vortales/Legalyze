@@ -131,10 +131,12 @@ AUTO_INSTALL_BROWSER = True  # если настоящего Chrome нет — �
                           # речевые пакеты Windows не нужны).
 REVIVE_AFTER_SHOW = True  # «оживлять» браузер после сворачивания/разворачивания
                           # окна: иначе вместо страницы остаётся чёрный фон.
-REVIVE_STEPS = (0, 120, 300, 600, 1200)  # мс: Chromium применяет перенос окна
-                          # и перерисовку не мгновенно, поэтому проверяем
-                          # несколько раз подряд и останавливаемся, как только
-                          # два измерения подряд сошлись.
+REVIVE_STEPS = (0, 120, 300, 600, 1200, 2000)  # мс: Chromium применяет
+                          # перенос окна и перерисовку не мгновенно, поэтому
+                          # проверяем несколько раз подряд. Последний шаг —
+                          # жёсткий предел: шторка в любом случае снимается.
+REVIVE_SETTLE_N = 3       # сколько ОДИНАКОВЫХ измерений подряд считать, что
+                          # браузер устоялся (innerWidth, dpr, размер окна)
 
 # --- поведение лишних окон браузера ---
 CLOSE_STRAY_WINDOWS = True    # после скрытия закрывать лишнее окно приложения
@@ -476,7 +478,7 @@ from win32_hotkeys import HotkeyMonitor, HOTKEY_TOGGLE_ID, HOTKEY_MIC_ID
 from web_compat import (JS_PURGE, JS_MIC_TOGGLE, JS_MIC_STOP, JS_MIC_START,
                         CONSENT_CLICK_JS, JS_LIGHT_THEME, speech_lang_js)
 from native_browser import (NativeBrowser, discover_browsers, choose_target,
-                            apply_zoom, zoom_ok, grant_microphone,
+                            apply_zoom, apply_viewport, zoom_ok, grant_microphone,
                             speech_surface)
 import native_browser
 import win32_embed
@@ -3127,6 +3129,9 @@ class PromptSelectionWindow(QDialog):
 
 class MainWindow(QMainWindow):
     overlay_state = pyqtSignal(str, str, bool)
+    # v18.2: браузер устоялся — можно снимать шторку (сигнал нужен, потому что
+    # измерение идёт в фоновом потоке, а шторку снимает только главный).
+    revive_settled = pyqtSignal(bool)
     response_poll_finished = pyqtSignal(object)
     # Горячие клавиши опрашиваются таймером главного потока (win32_hotkeys),
     # никаких потоков/скрытых окон: колбэк приходит сразу в контекст Qt GUI.
@@ -3161,7 +3166,10 @@ class MainWindow(QMainWindow):
         self._was_hidden = False
         self._was_minimized = False
         self._revive_settled = 0
+        self._revive_last = None
+        self._settling = False
         self._zoom_lock = threading.Lock()
+        self.revive_settled.connect(self._on_revive_settled)
         # v18: язык речевого ввода и тема страницы (правятся в config.json).
         self.speech_lang = str(self.cfg.get("speech_lang") or SPEECH_LANG or "ru-RU")
         self.light_theme = bool(self.cfg.get("light_theme", FORCE_LIGHT_THEME))
@@ -3497,11 +3505,31 @@ class MainWindow(QMainWindow):
         """
         if self._closing:
             return
+        # v18.2: пока браузер «устаивается» после показа окна, шторка стоит
+        # независимо ни от чего — иначе съехавшая раскладка видна.
+        if getattr(self, "_settling", False):
+            self._cover_to_top()
+            return
         if self._chat_ready and self._prompt_selected():
             return
         self._cover_to_top()
 
+    @pyqtSlot(bool)
+    def _on_revive_settled(self, stable):
+        """Снять шторку: браузер встал на место (v18.2)."""
+        self._settling = False
+        if self._closing:
+            return
+        self._hide_overlay()
+        diag.event("browser.revealed", stable=bool(stable),
+                   settling=bool(getattr(self, "_settling", False)))
+
     def _hide_overlay(self):
+        # v18.2: во время стабилизации шторку не снимает никто — только
+        # `_on_revive_settled`, когда измерение подтвердило, что всё на месте.
+        if getattr(self, "_settling", False):
+            self._cover_to_top()
+            return
         self.overlay_state.emit("", "", False)
         # v17: пока промт не выбран, браузер остаётся закрытым шторкой —
         # окно ожидания стоит ровно до момента выбора промта.
@@ -3550,6 +3578,12 @@ class MainWindow(QMainWindow):
     def hideEvent(self, event):
         super().hideEvent(event)
         self._was_hidden = True
+        if not REVIVE_AFTER_SHOW:
+            return
+        # v18.2: шторка встаёт СЕЙЧАС, пока окно не видно. Когда окно
+        # покажут, пользователь увидит панель приложения, а не съезжающую
+        # страницу: шторка снимется только по сигналу «устоялось».
+        self._cover_to_top()
         # v18.1: окно всё равно не видно — ставим браузер точно на место,
         # чтобы к следующему показу он уже стоял там, где нужно.
         self._sync_browser_now()
@@ -3568,6 +3602,11 @@ class MainWindow(QMainWindow):
             if event.type() == QEvent.Type.WindowStateChange:
                 if self.isMinimized():
                     self._was_minimized = True
+                    # v18.2: свёрнутое окно всё равно не видно — поднимаем
+                    # шторку заранее, чтобы при развороте не мелькнула
+                    # съехавшая страница.
+                    if REVIVE_AFTER_SHOW:
+                        self._cover_to_top()
                 elif self._was_minimized:
                     self._was_minimized = False
                     self._schedule_revive()
@@ -3848,7 +3887,7 @@ class MainWindow(QMainWindow):
         threading.Thread(target=self._zoom_guard_once, args=(page, "timer"),
                          daemon=True).start()
 
-    def _zoom_guard_once(self, page, reason="guard"):
+    def _zoom_guard_once(self, page, reason="guard", pin_first=False):
         """ОДИН проход сторожа зума: измерить и, если надо, вернуть. True — всё верно.
 
         Выделено из `_ensure_zoom` в v18.1: после показа окна раскладку надо
@@ -3861,7 +3900,9 @@ class MainWindow(QMainWindow):
         if page is None or self._closing:
             return False
         if not self._zoom_lock.acquire(blocking=False):
-            return True          # уже проверяется в соседнем потоке
+            # Уже проверяется в соседнем потоке. Раньше здесь возвращалось
+            # True, и пропущенный проход засчитывался как «всё верно».
+            return None
         try:
             logical_w, logical_h, physical_w, physical_h = self._zoom_args()
             # v18: язык и тема держатся намертво — после перезагрузки
@@ -3881,6 +3922,22 @@ class MainWindow(QMainWindow):
                                   physical_h, zoom=PAGE_ZOOM)
             if ok:
                 return True
+            if pin_first:
+                # v18.2: сначала прибиваем раскладку ОДНИМ вызовом — так
+                # ширина страницы перестаёт зависеть от размера окна, и
+                # «качка» прекращается. Лестница переборов ниже даёт несколько
+                # видимых перевёрсток подряд — она только на крайний случай.
+                try:
+                    apply_viewport(page, logical_w, logical_h, physical_w,
+                                   physical_h, PAGE_ZOOM)
+                    time.sleep(0.12)
+                except Exception:
+                    diag.exception("main.zoom_pin")
+                ok, metrics = zoom_ok(page, logical_w, logical_h, physical_w,
+                                      physical_h, zoom=PAGE_ZOOM)
+                if ok:
+                    diag.event("browser.zoom_pinned", reason=str(reason))
+                    return True
             result = apply_zoom(page, logical_w, logical_h, physical_w,
                                 physical_h, zoom=PAGE_ZOOM)
             diag.event("browser.zoom_restored",
@@ -4460,9 +4517,30 @@ class MainWindow(QMainWindow):
     def _schedule_revive(self):
         if not REVIVE_AFTER_SHOW or self._closing:
             return
+        # «Оживлять» нечего (резервный движок, страница ещё не готова) —
+        # шторку тогда не поднимаем вообще, иначе она осталась бы навсегда.
+        if not self.native_mode:
+            return
+        if getattr(getattr(self, "worker", None), "page", None) is None:
+            return
         self._revive_settled = 0
+        self._revive_last = None
+        self._revive_step = 0
+        self._settling = True
+        # Шторка уже поднята в hideEvent/минимизации — поднимаем на всякий
+        # случай и здесь: браузер показываем только устоявшимся.
+        self._cover_to_top()
         for delay in REVIVE_STEPS:
             QTimer.singleShot(delay, self._revive_browser)
+        # Страховка: шторка не остаётся навсегда ни при каких обстоятельствах.
+        QTimer.singleShot(int(REVIVE_STEPS[-1]) + 1500, self._settle_watchdog)
+
+    def _settle_watchdog(self):
+        """Снять шторку принудительно, если стабилизация не завершилась."""
+        if not getattr(self, "_settling", False):
+            return
+        diag.event("browser.settle_watchdog")
+        self._finish_settle(False)
 
     def _browser_sync_args(self):
         """(user32, hwnd, parent, inset) для СИНХРОННОГО переноса окна браузера.
@@ -4502,41 +4580,47 @@ class MainWindow(QMainWindow):
         threading.Thread(target=task, daemon=True).start()
 
     def _revive_browser(self):
-        """Вернуть браузер на место и перерисовать его после показа окна (v18.1).
+        """Вернуть браузер на место и показать его ТОЛЬКО устоявшимся (v18.2).
 
-        Пока родительское окно скрыто, скрыто и дочернее окно браузера, а
-        Chromium приостанавливает отрисовку: после показа остаётся чёрный
-        прямоугольник (v17). Обычный `sync()` переносит окно **асинхронно**
-        (`SWP_ASYNCWINDOWPOS`): запрос уходит в поток Chrome и не ждётся,
-        поэтому окно браузера ещё секунду-две висит на старом месте —
-        содержимое видно съехавшим, и только сторож зума (раз в 5 с)
-        возвращает всё на место. Отсюда «объекты съехали и встали через
-        2 секунды».
+        Что происходит при показе скрытого окна: Chromium не мгновенно
+        применяет перенос окна (`SetWindowPos`) и перерисовку, а размер окна
+        браузера успевает поменяться. На нативном зуме (из настроек профиля)
+        ширина раскладки следует за размером окна, поэтому страница
+        перевёрстывается прямо на глазах: «съехала вправо-вниз, вернулась,
+        снова съехала, вернулась». Лечить только скорость бесполезно — сама
+        «качка» остаётся.
 
-        Что делается здесь, на каждом шаге `REVIVE_STEPS`:
+        Поэтому:
 
-        1. **синхронный** перенос окна (`win32_embed.sync_now`, без
-           `SWP_ASYNCWINDOWPOS`) — пока вызов не вернулся, окно уже там, где
-           нужно, поэтому съехавший кадр просто не успевает появиться;
-        2. `ShowWindow(SW_SHOWNA)` + `InvalidateRect`/`UpdateWindow` — кадр;
-        3. по CDP: `Page.bringToFront`, событие `resize`, язык и тема;
-        4. **измерение раскладки и немедленный возврат зума 67 %**, если
-           измерение не сошлось (`_zoom_guard_once`) — а не через 5 с;
-        5. «дёрганье» метрик на 1 px — только когда они уже верные.
-
-        Останавливаемся, как только два измерения подряд сошлись.
+        * **шторка стоит всё время стабилизации** (`_settling`): пользователь
+          видит панель приложения, а не прыгающую страницу. Шторку поднимает
+          `hideEvent`/минимизация, то есть ДО показа окна, и снимает только
+          сигнал `revive_settled`;
+        * окно переносится **синхронно** (`win32_embed.sync_now`, без
+          `SWP_ASYNCWINDOWPOS`), раскладка при необходимости прибивается
+          ОДНИМ вызовом CDP, а не лестницей переборов с видимыми
+          промежуточными состояниями;
+        * «устоялось» = `REVIVE_SETTLE_N` **одинаковых** измерений подряд
+          (`innerWidth`, `dpr`, размер окна, сдвиг). На последнем шаге
+          `REVIVE_STEPS` шторка снимается в любом случае — жёсткий предел,
+          чтобы она never не заблокировала интерфейс.
         """
+        if not getattr(self, "_settling", False):
+            return          # уже устоялось — больше не дёргаем
         if self._closing or not self.native_mode:
+            # Режим сменился или приложение закрывается — шторку снимаем,
+            # иначе она осталась бы навсегда.
+            self._finish_settle(False)
             return
-        if getattr(self, "_revive_settled", 0) >= 2:
-            return          # уже всё на месте — дальше не дёргаем
         args = self._browser_sync_args()
         if args is None:
+            self._finish_settle(False)
             return
         user32, hwnd, parent, inset = args
         page = getattr(getattr(self, "worker", None), "page", None)
         step = getattr(self, "_revive_step", 0)
         self._revive_step = step + 1
+        last_step = step >= len(REVIVE_STEPS) - 1
 
         def task():
             try:
@@ -4550,28 +4634,71 @@ class MainWindow(QMainWindow):
                 except Exception:
                     diag.exception("main.revive_win32")
                 if page is None:
+                    self._finish_settle(False)
                     return
                 try:
                     page.send("Page.bringToFront", {}, timeout=3)
                 except Exception:
                     pass
-                try:
-                    page.eval(JS_REVIVE, timeout=3)
-                except Exception:
-                    pass
-                # Раскладка — ИЗМЕРЕНИЕМ и сразу, без ожидания сторожа.
-                ok = self._zoom_guard_once(page, reason="revive")
+                # Раскладка — ИЗМЕРЕНИЕМ; при необходимости прибивается сразу
+                # и одним вызовом, а не по таймеру раз в 5 с.
+                ok = self._zoom_guard_once(page, reason="revive", pin_first=True)
                 if ok:
                     self._nudge_metrics(page)
-                settled = (getattr(self, "_revive_settled", 0) + 1) if ok else 0
+                signature = self._layout_signature(page, user32, hwnd, inset)
+                # «Устоялось» — это ОДИНАКОВОЕ измерение несколько раз подряд:
+                # пока окно/раскладка меняются, подпись другая и счёт сбрасывается.
+                if ok and signature is not None and signature == self._revive_last:
+                    settled = int(getattr(self, "_revive_settled", 0)) + 1
+                else:
+                    settled = 1 if ok else 0
                 self._revive_settled = settled
+                self._revive_last = signature
                 diag.event("browser.revive", step=int(step), ok=bool(ok),
                            settled=int(settled), inset=list(inset),
+                           signature=list(signature or ()),
                            client=list(win32_embed.client_size(user32, hwnd)))
+                if settled >= int(REVIVE_SETTLE_N) or last_step:
+                    self._finish_settle(settled >= int(REVIVE_SETTLE_N))
             except Exception:
                 diag.exception("main.revive_cdp")
+                self._finish_settle(False)
 
         threading.Thread(target=task, daemon=True).start()
+
+    def _layout_signature(self, page, user32, hwnd, inset):
+        """Подпись текущего состояния: (innerWidth, dpr, размер окна, сдвиг).
+
+        Пока Chromium «устаивается», подпись меняется — по ней и определяется
+        момент, когда браузер действительно встал на место.
+        """
+        try:
+            metrics = native_browser.page_metrics(page)
+            inner = int((metrics or {}).get("innerWidth") or 0)
+            dpr = round(float((metrics or {}).get("dpr") or 0.0), 3)
+        except Exception:
+            diag.exception("main.revive_metrics")
+            inner, dpr = 0, 0.0
+        try:
+            client = tuple(int(v) for v in win32_embed.client_size(user32, hwnd))
+        except Exception:
+            diag.exception("main.revive_client")
+            client = (0, 0)
+        return (inner, dpr, client[0], client[1], tuple(int(v) for v in inset))
+
+    def _finish_settle(self, stable):
+        """Снять шторку (сигнал уходит в главный поток Qt)."""
+        if not getattr(self, "_settling", False):
+            return
+        try:
+            self.revive_settled.emit(bool(stable))
+        except Exception:
+            diag.exception("main.revive_signal")
+            self._settling = False
+            try:
+                self._hide_overlay()
+            except Exception:
+                diag.exception("main.revive_reveal_fallback")
 
     def _nudge_metrics(self, page):
         """На 1 px изменить ширину эмуляции и вернуть: Chromium рисует новый кадр.

@@ -831,7 +831,8 @@ class SourceTests(unittest.TestCase):
         # раскладку чинил сторож зума раз в 5 с. Теперь проверка и починка
         # запускаются сразу же, на каждом шаге «оживления».
         main_src = (ROOT / 'main.py').read_text()
-        for text in ('def _zoom_guard_once(', 'self._zoom_guard_once(page, reason="revive")',
+        for text in ('def _zoom_guard_once(',
+                     'self._zoom_guard_once(page, reason="revive", pin_first=True)',
                      '_zoom_lock', 'REVIVE_STEPS', 'self._revive_settled'):
             self.assertIn(text, main_src)
         tree = ast.parse(main_src)
@@ -869,6 +870,56 @@ class SourceTests(unittest.TestCase):
         self.assertNotIn('SWP_ASYNCWINDOWPOS', body)
         sync_body = embed.split('def sync(', 1)[1].split('\ndef ', 1)[0]
         self.assertIn('SWP_ASYNCWINDOWPOS', sync_body)
+
+    def test_v18_2_holds_the_cover_until_the_browser_settles(self):
+        # «Съехало — вернулось — снова съехало»: страницу больше не показывают,
+        # пока измерение не подтвердит, что браузер устоялся.
+        main_src = (ROOT / 'main.py').read_text()
+        for text in ('revive_settled = pyqtSignal(bool)',
+                     'def _on_revive_settled(', 'def _layout_signature(',
+                     'def _finish_settle(', 'REVIVE_SETTLE_N',
+                     'self._revive_last', 'self._settling'):
+            self.assertIn(text, main_src)
+        tree = ast.parse(main_src)
+        window = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                      and n.name == 'MainWindow')
+        methods = {m.name: m for m in window.body if isinstance(m, ast.FunctionDef)}
+
+        # Шторка поднимается ДО показа окна: при скрытии и при минимизации.
+        self.assertIn('self._cover_to_top()', ast.unparse(methods['hideEvent']))
+        self.assertIn('self._cover_to_top()', ast.unparse(methods['_schedule_revive']))
+
+        # ...и её никто не снимает, пока идёт стабилизация.
+        hold = ast.unparse(methods['_hold_cover_if_needed'])
+        self.assertIn('_settling', hold)
+        self.assertIn('_cover_to_top()', hold)
+        hide_overlay = ast.unparse(methods['_hide_overlay'])
+        self.assertIn('_settling', hide_overlay)
+
+        # Снимает шторку только сигнал из главного потока Qt.
+        self.assertIn('self.revive_settled.emit(', ast.unparse(methods['_finish_settle']))
+        self.assertIn('@pyqtSlot(bool)', ast.unparse(methods['_on_revive_settled']))
+
+        # «Устоялось» = одинаковое измерение REVIVE_SETTLE_N раз подряд,
+        # но последний шаг снимает шторку в любом случае.
+        revive = ast.unparse(methods['_revive_browser'])
+        self.assertIn('REVIVE_SETTLE_N', revive)
+        self.assertIn('last_step', revive)
+        self.assertIn('signature == self._revive_last', revive)
+        # Раскладку прибиваем ОДНИМ вызовом, а не лестницей переборов.
+        self.assertIn('apply_viewport(page', ast.unparse(methods['_zoom_guard_once']))
+
+    def test_v18_2_last_step_releases_the_cover_for_sure(self):
+        # Жёсткий предел: шторка НИКОГДА не остаётся навсегда.
+        main_src = (ROOT / 'main.py').read_text()
+        self.assertIn('REVIVE_STEPS = (0, 120, 300, 600, 1200, 2000)', main_src)
+        self.assertIn('REVIVE_SETTLE_N = 3', main_src)
+        tree = ast.parse(main_src)
+        window = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                      and n.name == 'MainWindow')
+        methods = {m.name: m for m in window.body if isinstance(m, ast.FunctionDef)}
+        revive = ast.unparse(methods['_revive_browser'])
+        self.assertIn('len(REVIVE_STEPS) - 1', revive)
 
     def test_v18_revives_the_browser_after_minimize(self):
         main_src = (ROOT / 'main.py').read_text()
