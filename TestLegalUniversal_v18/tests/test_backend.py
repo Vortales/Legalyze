@@ -832,7 +832,8 @@ class SourceTests(unittest.TestCase):
         # запускаются сразу же, на каждом шаге «оживления».
         main_src = (ROOT / 'main.py').read_text()
         for text in ('def _zoom_guard_once(',
-                     'self._zoom_guard_once(page, reason="revive", pin_first=True)',
+                     'self._zoom_guard_once(page, reason="revive-final",\n'
+                     '                                               pin_first=True)',
                      '_zoom_lock', 'REVIVE_STEPS', 'self._revive_settled'):
             self.assertIn(text, main_src)
         tree = ast.parse(main_src)
@@ -840,9 +841,11 @@ class SourceTests(unittest.TestCase):
                       and n.name == 'MainWindow')
         methods = {m.name: m for m in window.body if isinstance(m, ast.FunctionDef)}
         revive = ast.unparse(methods['_revive_browser'])
-        move = ast.unparse(methods['_browser_sync_args'])
+        # v18.3: окно двигается один раз — в финализации, а не на каждом шаге.
+        move = (ast.unparse(methods['_browser_sync_args'])
+                + ast.unparse(methods['_finalize_and_reveal']))
         # Обычный sync() асинхронный (SWP_ASYNCWINDOWPOS) — здесь нужен не он.
-        self.assertIn('sync_now(', revive + move)
+        self.assertIn('sync_now(', move)
         # (в пояснении к методу имя флага упоминается — считаем только код)
         self.assertNotIn('SWP_ASYNCWINDOWPOS', _without_docstring(revive))
         # В фоновый поток уходят только HWND и числа, Qt вызывается в главном.
@@ -912,14 +915,52 @@ class SourceTests(unittest.TestCase):
     def test_v18_2_last_step_releases_the_cover_for_sure(self):
         # Жёсткий предел: шторка НИКОГДА не остаётся навсегда.
         main_src = (ROOT / 'main.py').read_text()
-        self.assertIn('REVIVE_STEPS = (0, 120, 300, 600, 1200, 2000)', main_src)
+        self.assertIn('REVIVE_STEPS = (0, 150, 350, 600, 900, 1300, 1800, 2400)',
+                      main_src)
         self.assertIn('REVIVE_SETTLE_N = 3', main_src)
+        # Раньше срока GUI прогрузки не снимаем: возмущение приходит позже.
+        self.assertIn('REVIVE_MIN_MS = 1200', main_src)
         tree = ast.parse(main_src)
         window = next(n for n in tree.body if isinstance(n, ast.ClassDef)
                       and n.name == 'MainWindow')
         methods = {m.name: m for m in window.body if isinstance(m, ast.FunctionDef)}
         revive = ast.unparse(methods['_revive_browser'])
         self.assertIn('len(REVIVE_STEPS) - 1', revive)
+
+    def test_v18_3_shows_the_loading_gui_until_the_browser_is_ready(self):
+        # Пользователь: «на этапе повторного нажатия "Окно" нет GUI прогрузки
+        # с наивысшим приоритетом, очень сильно мигает браузер».
+        main_src = (ROOT / 'main.py').read_text()
+        for text in ('REVIVE_TITLE', 'REVIVE_MESSAGE', 'REVIVE_MIN_MS',
+                     'REVIVE_FINAL_MS', 'def _finalize_and_reveal('):
+            self.assertIn(text, main_src)
+        tree = ast.parse(main_src)
+        window = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                      and n.name == 'MainWindow')
+        methods = {m.name: m for m in window.body if isinstance(m, ast.FunctionDef)}
+        # Тот же индикатор, что на старте (отдельное окно поверх всех).
+        schedule = ast.unparse(methods['_schedule_revive'])
+        self.assertIn('self._show_overlay(REVIVE_TITLE, REVIVE_MESSAGE)', schedule)
+        while_settling = ast.unparse(methods['_hold_cover_if_needed'])
+        self.assertIn('force_topmost(int(self.overlay.winId()))', while_settling)
+
+    def test_v18_3_does_not_touch_the_browser_window_more_than_once(self):
+        # Мигание рождалось от того, что окно дёргали на КАЖДОМ шаге: каждый
+        # SetWindowPos/InvalidateRect заставляет Chromium пересобрать кадр, а
+        # Chrome поднимает своё окно поверх шторки. Теперь окно трогается
+        # один раз — в финализации, когда шторка ещё стоит.
+        tree = ast.parse((ROOT / 'main.py').read_text())
+        window = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                      and n.name == 'MainWindow')
+        methods = {m.name: m for m in window.body if isinstance(m, ast.FunctionDef)}
+        measure = _without_docstring(ast.unparse(methods['_revive_browser']))
+        for forbidden in ('sync_now(', 'show_window(', 'invalidate(',
+                          'apply_viewport(', 'apply_zoom(', 'bringToFront'):
+            self.assertNotIn(forbidden, measure)
+        final = ast.unparse(methods['_finalize_and_reveal'])
+        for required in ('sync_now(', 'show_window(', 'invalidate(',
+                         'bringToFront', 'pin_first=True', 'time.sleep('):
+            self.assertIn(required, final)
 
     def test_v18_revives_the_browser_after_minimize(self):
         main_src = (ROOT / 'main.py').read_text()

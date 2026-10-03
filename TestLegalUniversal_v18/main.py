@@ -131,12 +131,20 @@ AUTO_INSTALL_BROWSER = True  # если настоящего Chrome нет — �
                           # речевые пакеты Windows не нужны).
 REVIVE_AFTER_SHOW = True  # «оживлять» браузер после сворачивания/разворачивания
                           # окна: иначе вместо страницы остаётся чёрный фон.
-REVIVE_STEPS = (0, 120, 300, 600, 1200, 2000)  # мс: Chromium применяет
-                          # перенос окна и перерисовку не мгновенно, поэтому
-                          # проверяем несколько раз подряд. Последний шаг —
-                          # жёсткий предел: шторка в любом случае снимается.
+REVIVE_STEPS = (0, 150, 350, 600, 900, 1300, 1800, 2400)  # мс: Chromium
+                          # применяет перенос окна и перерисовку не мгновенно.
+                          # Последний шаг — жёсткий предел: GUI прогрузки
+                          # снимается в любом случае.
 REVIVE_SETTLE_N = 3       # сколько ОДИНАКОВЫХ измерений подряд считать, что
                           # браузер устоялся (innerWidth, dpr, размер окна)
+REVIVE_MIN_MS = 1200      # раньше этого срока GUI прогрузки НЕ снимаем даже
+                          # при совпавших измерениях: возмущение у Chromium
+                          # начинается позже первых кадров (по приёмке — около
+                          # двух секунд), поэтому «три одинаковых кадра на
+                          # 300-й миллисекунде» ещё ни о чём не говорят.
+REVIVE_FINAL_MS = 180     # пауза после финальной правки: кадр должен лечь
+REVIVE_TITLE = "Подготовка страницы"      # тот же индикатор, что на старте
+REVIVE_MESSAGE = "Пожалуйста, подождите…"
 
 # --- поведение лишних окон браузера ---
 CLOSE_STRAY_WINDOWS = True    # после скрытия закрывать лишнее окно приложения
@@ -3505,10 +3513,16 @@ class MainWindow(QMainWindow):
         """
         if self._closing:
             return
-        # v18.2: пока браузер «устаивается» после показа окна, шторка стоит
-        # независимо ни от чего — иначе съехавшая раскладка видна.
+        # v18.3: пока браузер «устаивается» после показа окна, GUI прогрузки
+        # стоит независимо ни от чего — иначе съехавшая раскладка видна.
         if getattr(self, "_settling", False):
             self._cover_to_top()
+            try:
+                if self.overlay.isVisible():
+                    self.overlay.sync_geometry()
+                    force_topmost(int(self.overlay.winId()))
+            except Exception:
+                diag.exception("main.settle_overlay_top")
             return
         if self._chat_ready and self._prompt_selected():
             return
@@ -4527,13 +4541,15 @@ class MainWindow(QMainWindow):
         self._revive_last = None
         self._revive_step = 0
         self._settling = True
-        # Шторка уже поднята в hideEvent/минимизации — поднимаем на всякий
-        # случай и здесь: браузер показываем только устоявшимся.
+        # v18.3: ровно тот же GUI прогрузки, что на этапе «Ожидание страницы»,
+        # и тем же наивысшим приоритетом: индикатор — отдельное окно поверх
+        # всех (WindowStaysOnTop + force_topmost), под ним — шторка.
         self._cover_to_top()
+        self._show_overlay(REVIVE_TITLE, REVIVE_MESSAGE)
         for delay in REVIVE_STEPS:
             QTimer.singleShot(delay, self._revive_browser)
-        # Страховка: шторка не остаётся навсегда ни при каких обстоятельствах.
-        QTimer.singleShot(int(REVIVE_STEPS[-1]) + 1500, self._settle_watchdog)
+        # Страховка: GUI прогрузки не остаётся навсегда ни при каких условиях.
+        QTimer.singleShot(int(REVIVE_STEPS[-1]) + 2500, self._settle_watchdog)
 
     def _settle_watchdog(self):
         """Снять шторку принудительно, если стабилизация не завершилась."""
@@ -4579,37 +4595,29 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=task, daemon=True).start()
 
+
     def _revive_browser(self):
-        """Вернуть браузер на место и показать его ТОЛЬКО устоявшимся (v18.2).
+        """Держать GUI прогрузки, пока браузер не встанет на место (v18.3).
 
-        Что происходит при показе скрытого окна: Chromium не мгновенно
-        применяет перенос окна (`SetWindowPos`) и перерисовку, а размер окна
-        браузера успевает поменяться. На нативном зуме (из настроек профиля)
-        ширина раскладки следует за размером окна, поэтому страница
-        перевёрстывается прямо на глазах: «съехала вправо-вниз, вернулась,
-        снова съехала, вернулась». Лечить только скорость бесполезно — сама
-        «качка» остаётся.
+        Пока GUI прогрузки стоит, **окно браузера не трогаем вообще** — только
+        измеряем. Это главное отличие от v18.2: каждый `SetWindowPos` /
+        `ShowWindow` / `InvalidateRect` заставляет Chromium пересобрать кадр,
+        а Chrome при этом поднимает своё окно — и пользователь видит мигание
+        поверх шторки. Поэтому вся работа с окном делается **один раз**, в
+        `_finalize_and_reveal()`, когда измерения показали, что всё устоялось.
 
-        Поэтому:
-
-        * **шторка стоит всё время стабилизации** (`_settling`): пользователь
-          видит панель приложения, а не прыгающую страницу. Шторку поднимает
-          `hideEvent`/минимизация, то есть ДО показа окна, и снимает только
-          сигнал `revive_settled`;
-        * окно переносится **синхронно** (`win32_embed.sync_now`, без
-          `SWP_ASYNCWINDOWPOS`), раскладка при необходимости прибивается
-          ОДНИМ вызовом CDP, а не лестницей переборов с видимыми
-          промежуточными состояниями;
-        * «устоялось» = `REVIVE_SETTLE_N` **одинаковых** измерений подряд
-          (`innerWidth`, `dpr`, размер окна, сдвиг). На последнем шаге
-          `REVIVE_STEPS` шторка снимается в любом случае — жёсткий предел,
-          чтобы она never не заблокировала интерфейс.
+        Снимаем GUI прогрузки только когда:
+        * прошло не меньше `REVIVE_MIN_MS` (возмущение у Chromium начинается
+          позже первых кадров);
+        * **И** последние `REVIVE_SETTLE_N` измерения подряд одинаковы
+          (`innerWidth`, `dpr`, размер окна, сдвиг);
+        * либо наступил последний шаг `REVIVE_STEPS` (жёсткий предел).
         """
         if not getattr(self, "_settling", False):
             return          # уже устоялось — больше не дёргаем
         if self._closing or not self.native_mode:
-            # Режим сменился или приложение закрывается — шторку снимаем,
-            # иначе она осталась бы навсегда.
+            # Режим сменился или приложение закрывается — GUI снимаем, иначе
+            # он остался бы навсегда.
             self._finish_settle(False)
             return
         args = self._browser_sync_args()
@@ -4618,51 +4626,82 @@ class MainWindow(QMainWindow):
             return
         user32, hwnd, parent, inset = args
         page = getattr(getattr(self, "worker", None), "page", None)
-        step = getattr(self, "_revive_step", 0)
+        step = int(getattr(self, "_revive_step", 0))
         self._revive_step = step + 1
+        delay = int(REVIVE_STEPS[step]) if step < len(REVIVE_STEPS) else int(REVIVE_STEPS[-1])
         last_step = step >= len(REVIVE_STEPS) - 1
+        # Шторка и индикатор — поверх (это главный поток Qt).
+        self._cover_to_top()
+        if page is None:
+            if last_step:
+                self._finish_settle(False)
+            return
+
+        def task():
+            settled = 0
+            try:
+                # ТОЛЬКО измерение: окно не двигаем, не перерисовываем,
+                # раскладку не трогаем — иначе Chrome лезет поверх шторки.
+                signature = self._layout_signature(page, user32, hwnd, inset)
+                if signature == self._revive_last:
+                    settled = int(getattr(self, "_revive_settled", 0)) + 1
+                else:
+                    settled = 1
+                self._revive_settled = settled
+                self._revive_last = signature
+                diag.event("browser.revive", step=int(step), ms=int(delay),
+                           settled=int(settled), inset=list(inset),
+                           signature=list(signature or ()))
+            except Exception:
+                diag.exception("main.revive_measure")
+            enough = (delay >= int(REVIVE_MIN_MS)
+                      and settled >= int(REVIVE_SETTLE_N))
+            if last_step or enough:
+                self._finalize_and_reveal()
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _finalize_and_reveal(self):
+        """ОДИН раз поставить окно и раскладку, пока GUI прогрузки ещё стоит.
+
+        Вызывается, когда измерения показали, что браузер устоялся (или на
+        жёстком пределе). Здесь и только здесь трогаем окно браузера, чтобы не
+        провоцировать Chromium на перерисовку на глазах у пользователя.
+        """
+        args = self._browser_sync_args()
+        if args is None:
+            self._finish_settle(False)
+            return
+        user32, hwnd, parent, inset = args
+        page = getattr(getattr(self, "worker", None), "page", None)
 
         def task():
             try:
                 try:
                     win32_embed.sync_now(user32, hwnd, parent, inset)
-                except Exception:
-                    diag.exception("main.revive_sync")
-                try:
                     win32_embed.show_window(user32, hwnd)
                     win32_embed.invalidate(user32, hwnd)
                 except Exception:
                     diag.exception("main.revive_win32")
-                if page is None:
-                    self._finish_settle(False)
-                    return
-                try:
-                    page.send("Page.bringToFront", {}, timeout=3)
-                except Exception:
-                    pass
-                # Раскладка — ИЗМЕРЕНИЕМ; при необходимости прибивается сразу
-                # и одним вызовом, а не по таймеру раз в 5 с.
-                ok = self._zoom_guard_once(page, reason="revive", pin_first=True)
-                if ok:
-                    self._nudge_metrics(page)
-                signature = self._layout_signature(page, user32, hwnd, inset)
-                # «Устоялось» — это ОДИНАКОВОЕ измерение несколько раз подряд:
-                # пока окно/раскладка меняются, подпись другая и счёт сбрасывается.
-                if ok and signature is not None and signature == self._revive_last:
-                    settled = int(getattr(self, "_revive_settled", 0)) + 1
-                else:
-                    settled = 1 if ok else 0
-                self._revive_settled = settled
-                self._revive_last = signature
-                diag.event("browser.revive", step=int(step), ok=bool(ok),
-                           settled=int(settled), inset=list(inset),
-                           signature=list(signature or ()),
-                           client=list(win32_embed.client_size(user32, hwnd)))
-                if settled >= int(REVIVE_SETTLE_N) or last_step:
-                    self._finish_settle(settled >= int(REVIVE_SETTLE_N))
+                if page is not None:
+                    try:
+                        page.send("Page.bringToFront", {}, timeout=3)
+                    except Exception:
+                        pass
+                    try:
+                        page.eval(JS_REVIVE, timeout=3)
+                    except Exception:
+                        pass
+                    # Раскладка — ИЗМЕРЕНИЕМ и, если нужно, одним вызовом CDP.
+                    ok = self._zoom_guard_once(page, reason="revive-final",
+                                               pin_first=True)
+                    if ok:
+                        self._nudge_metrics(page)
+                # Даём кадру лечь: Chromium перерисовывает не мгновенно.
+                time.sleep(max(0.05, float(REVIVE_FINAL_MS) / 1000.0))
             except Exception:
-                diag.exception("main.revive_cdp")
-                self._finish_settle(False)
+                diag.exception("main.revive_final")
+            self._finish_settle(True)
 
         threading.Thread(target=task, daemon=True).start()
 
