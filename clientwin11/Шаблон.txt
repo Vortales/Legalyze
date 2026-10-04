@@ -1,0 +1,8 @@
+{
+  "Name": "Mike Macmillan",
+  "ID": "85028",
+  "Fraction": "SANG",
+  "Rang": "11",
+  "Department": "MP",
+  "JobTitle": "Заместитель командующего MP, сенатор NG"
+}
